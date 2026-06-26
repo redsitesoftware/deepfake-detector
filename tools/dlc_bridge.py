@@ -189,13 +189,20 @@ class _SwapWorker(threading.Thread):
                 raw = self._in_q.get(timeout=0.05)
             except queue.Empty:
                 continue
-            if self._swap_flag.is_set():
+            # Snapshot swap state BEFORE the (potentially slow) swap call.
+            # If SPACE fires during the swap, the state will have changed and
+            # we discard this output rather than showing a stale mixed frame.
+            was_swapping = self._swap_flag.is_set()
+            if was_swapping:
                 try:
                     frame = self._swapper.swap(raw)
                 except Exception:
                     frame = raw
             else:
                 frame = raw
+            # Discard if toggle happened while we were swapping
+            if self._swap_flag.is_set() != was_swapping:
+                continue
             # drop oldest if consumer is slow
             try:
                 self._out_q.put_nowait((raw, frame))

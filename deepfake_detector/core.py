@@ -71,20 +71,20 @@ class Detector:
         liveness_score = None if liveness_result is None else float(not liveness_result.is_live)
 
         # CNN weight is low — bootstrap model is trained on GAN/diffusion fakes,
-        # not face-swaps. Temporal flicker is the most reliable signal for DLC.
+        # not face-swaps. Temporal is now an anomaly score relative to baseline.
         confidence = _weighted_mean(
             [
                 (cnn_score, 0.25),
                 (
                     temporal_result.temporal_score if temporal_result is not None else None,
-                    0.55,
+                    0.45,
                 ),
-                (liveness_score, 0.20),
+                (liveness_score, 0.30),
             ]
         )
         latency_ms = (time.perf_counter() - start) * 1000.0
         return DetectionResult(
-            is_fake=confidence > 0.5,
+            is_fake=confidence > 0.55,
             confidence=confidence,
             signals={
                 "cnn": cnn_score,

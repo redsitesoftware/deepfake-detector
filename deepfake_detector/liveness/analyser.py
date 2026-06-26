@@ -150,12 +150,18 @@ class LivenessAnalyser:
         flags: list[str] = []
 
         if self.frame_index >= self.blink_window_frames:
-            if blink_rate < 3.0:
+            # Only flag truly zero-blink windows — normal blink rate is
+            # 15-20/min but people staring at a screen blink less.
+            # Flag only if < 1 blink per minute (nearly absent).
+            if blink_rate < 1.0:
                 flags.append("blink_rate_too_low")
-            elif blink_rate > 40.0:
+            elif blink_rate > 60.0:
                 flags.append("blink_rate_too_high")
 
-        if head_pose_variance < 0.5:
+        # Require very low variance to flag — deepfakes tend to be completely
+        # static or have robotic motion. A sitting human will have > 0.15°
+        # of natural micro-movement even when trying to stay still.
+        if head_pose_variance < 0.15:
             flags.append("static_head_pose")
 
         return LivenessResult(
