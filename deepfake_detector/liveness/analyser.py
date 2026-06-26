@@ -2,12 +2,26 @@ from __future__ import annotations
 
 import math
 from collections import deque
+from pathlib import Path
 from typing import Any
 
 import cv2
 import numpy as np
 
 from deepfake_detector.types import LivenessResult
+
+_MODEL_PATH = Path(__file__).parent.parent / "models" / "face_landmarker.task"
+_MODEL_URL = "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task"
+
+
+def _ensure_model() -> None:
+    if _MODEL_PATH.exists():
+        return
+    import urllib.request
+    _MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
+    print(f"[liveness] Downloading face landmarker model to {_MODEL_PATH} ...")
+    urllib.request.urlretrieve(_MODEL_URL, _MODEL_PATH)
+    print("[liveness] Model downloaded.")
 
 LEFT_EYE_INDICES = (33, 160, 158, 133, 153, 144)
 RIGHT_EYE_INDICES = (362, 385, 387, 263, 373, 380)
@@ -70,20 +84,26 @@ class LivenessAnalyser:
 
     def _get_face_mesh(self):
         if self._face_mesh is None:
+            _ensure_model()
             import mediapipe as mp
 
-            self._face_mesh = mp.solutions.face_mesh.FaceMesh(
-                static_image_mode=False,
-                max_num_faces=1,
-                refine_landmarks=False,
-                min_detection_confidence=0.5,
+            options = mp.tasks.vision.FaceLandmarkerOptions(
+                base_options=mp.tasks.BaseOptions(model_asset_path=str(_MODEL_PATH)),
+                running_mode=mp.tasks.vision.RunningMode.IMAGE,
+                num_faces=1,
+                min_face_detection_confidence=0.5,
+                min_face_presence_confidence=0.5,
                 min_tracking_confidence=0.5,
             )
+            self._face_mesh = mp.tasks.vision.FaceLandmarker.create_from_options(options)
         return self._face_mesh
 
     def close(self) -> None:
         if self._face_mesh is not None:
-            self._face_mesh.close()
+            try:
+                self._face_mesh.close()
+            except Exception:
+                pass
             self._face_mesh = None
 
     def reset(self) -> None:
@@ -100,16 +120,19 @@ class LivenessAnalyser:
             return None
 
         self.frame_index += 1
+        import mediapipe as mp
+
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
         face_mesh = self._get_face_mesh()
-        results = face_mesh.process(rgb_frame)
-        if not results.multi_face_landmarks:
+        detection = face_mesh.detect(mp_image)
+        if not detection.face_landmarks:
             return None
 
         height, width = frame.shape[:2]
-        face_landmarks = results.multi_face_landmarks[0].landmark
+        raw_landmarks = detection.face_landmarks[0]
         landmarks_2d = np.array(
-            [(landmark.x * width, landmark.y * height) for landmark in face_landmarks],
+            [(lm.x * width, lm.y * height) for lm in raw_landmarks],
             dtype=np.float64,
         )
 

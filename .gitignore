@@ -7,3 +7,5 @@ __pycache__/
 .runtime_uploads/
 build/
 dist/
+deepfake_detector/models/*.task
+deepfake_detector/models/*.onnx
