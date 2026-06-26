@@ -96,10 +96,11 @@ def _draw_detection_overlay(frame: np.ndarray, result, swap_on: bool) -> np.ndar
     _bar(frame, pad + 8, pad + 34, panel_w - 20, 8, conf, verdict_colour)
 
     # per-signal breakdown
+    s = result.signals or {}
     signals = [
-        ("CNN",      result.cnn_score),
-        ("Temporal", result.temporal_score),
-        ("Liveness", result.liveness_score),
+        ("CNN",      s.get("cnn")),
+        ("Temporal", s.get("temporal")),
+        ("Liveness", s.get("liveness")),
     ]
     for i, (name, score) in enumerate(signals):
         y_base = pad + 58 + i * lh
