@@ -242,6 +242,15 @@ class _DetectWorker(threading.Thread):
             with self._lock:
                 self.result    = r
                 self.detect_ms = ms
+            # verbose terminal output to diagnose signal quality
+            s = r.signals or {}
+            print(
+                f"[detect] {'FAKE' if r.is_fake else 'REAL'} {r.confidence:.2f} | "
+                f"cnn={s.get('cnn', 'n/a')!r:.5} "
+                f"temporal={s.get('temporal', 'n/a')!r:.5} "
+                f"liveness={s.get('liveness', 'n/a')!r:.5} "
+                f"({ms:.0f}ms)"
+            )
 
     def get_result(self):
         with self._lock:
@@ -399,10 +408,30 @@ def main() -> int:
             elif key == ord(" "):
                 if swap_flag.is_set():
                     swap_flag.clear()
-                    print("[bridge] Swap OFF ■  (real feed)")
+                    label = "OFF ■  (real feed)"
                 else:
                     swap_flag.set()
-                    print("[bridge] Swap ON ▶  (deepfake active)")
+                    label = "ON ▶  (deepfake active)"
+
+                # Flush stale frames from both queues so the swap worker
+                # starts producing frames in the new state immediately.
+                for q in (raw_q, swapped_q, detect_q):
+                    while not q.empty():
+                        try:
+                            q.get_nowait()
+                        except queue.Empty:
+                            break
+
+                # Reset detector temporal/liveness buffers so stale
+                # pre-toggle signal history doesn't bleed into new state.
+                if detector is not None:
+                    detector.temporal_buffer.clear()
+                    detector.liveness_analyser.reset()
+                    if detect_worker is not None:
+                        with detect_worker._lock:
+                            detect_worker.result = None
+
+                print(f"[bridge] Swap {label}")
 
     finally:
         stop_flag.set()

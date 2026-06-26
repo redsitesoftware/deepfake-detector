@@ -41,7 +41,7 @@ def _frame_step(source_fps: float, target_fps: float | None) -> int:
 
 
 class Detector:
-    def __init__(self, fps: float = 30.0, temporal_window_size: int = 16) -> None:
+    def __init__(self, fps: float = 30.0, temporal_window_size: int = 8) -> None:
         self.cnn = CNNDetector()
         self.temporal_buffer = TemporalBuffer(window_size=temporal_window_size)
         self.liveness_analyser = LivenessAnalyser(fps=fps)
@@ -70,14 +70,16 @@ class Detector:
         liveness_result = self.liveness_analyser.analyse(frame)
         liveness_score = None if liveness_result is None else float(not liveness_result.is_live)
 
+        # CNN weight is low — bootstrap model is trained on GAN/diffusion fakes,
+        # not face-swaps. Temporal flicker is the most reliable signal for DLC.
         confidence = _weighted_mean(
             [
-                (cnn_score, 0.5),
+                (cnn_score, 0.25),
                 (
                     temporal_result.temporal_score if temporal_result is not None else None,
-                    0.3,
+                    0.55,
                 ),
-                (liveness_score, 0.2),
+                (liveness_score, 0.20),
             ]
         )
         latency_ms = (time.perf_counter() - start) * 1000.0
