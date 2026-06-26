@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "deepfake-detector"
+version = "0.1.0"
+description = "MVP deepfake detection library and FastAPI service"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+dependencies = [
+    "opencv-python>=4.8",
+    "numpy>=1.23,<2",
+    "mediapipe>=0.10",
+    "transformers>=4.40",
+    "torch>=2.0",
+    "Pillow>=10.0",
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
+    "websockets>=12.0",
+    "python-multipart>=0.0.9",
+    "huggingface-hub>=0.22",
+    "scipy>=1.11",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.4", "httpx>=0.27"]
+
+[project.scripts]
+deepfake-detector-demo = "demo:main"
+
+[tool.setuptools.packages.find]
+include = ["deepfake_detector*", "api*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B"]
