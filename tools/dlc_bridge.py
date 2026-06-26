@@ -140,8 +140,16 @@ class _DLCSwapper:
         sys.path.insert(0, dlc_path)
         os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 
+        # Stub modules.ui before any DLC import triggers it — face_swapper
+        # → modules.core → modules.ui → PySide6 (not in bridge venv).
+        import types as _types
+        _ui_stub = _types.ModuleType("modules.ui")
+        _ui_stub.update_status = lambda *a, **kw: None
+        _ui_stub.check_and_ignore_nsfw = lambda *a, **kw: False
+        sys.modules.setdefault("modules.ui", _ui_stub)
+
         import modules.globals as g
-        g.execution_providers  = ["CoreMLExecutionProvider", "CPUExecutionProvider"]
+        g.execution_providers  = ["CPUExecutionProvider"]
         g.frame_processors     = ["face_swapper"]
         g.many_faces           = False
         g.map_faces            = False
