@@ -126,6 +126,8 @@ def main() -> int:
 
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
+    except KeyboardInterrupt:
+        pass
     finally:
         detector.close()
         capture.release()
