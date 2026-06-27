@@ -1,0 +1,33 @@
+{
+  "efficientnet_b4_deepfake": {
+    "v1.0": {
+      "hf_repo": "redsitesoftware/deepfake-detector-models",
+      "filename": "efficientnet_b4_v1.0.onnx",
+      "sha256": "PLACEHOLDER_efficientnet_b4_v1.0_fp32",
+      "format": "onnx_fp32",
+      "size_mb": 75,
+      "trained_on": ["FaceForensics++", "Celeb-DF-v2"],
+      "auc_celeb_df": 0.9944
+    },
+    "v1.0-fp16": {
+      "hf_repo": "redsitesoftware/deepfake-detector-models",
+      "filename": "efficientnet_b4_v1.0_fp16.onnx",
+      "sha256": "PLACEHOLDER_efficientnet_b4_v1.0_fp16",
+      "format": "onnx_fp16",
+      "size_mb": 38,
+      "trained_on": ["FaceForensics++", "Celeb-DF-v2"],
+      "auc_celeb_df": 0.9944
+    }
+  },
+  "face_detector_mtcnn": {
+    "v1.0": {
+      "hf_repo": "redsitesoftware/deepfake-detector-models",
+      "filename": "face_detector_mtcnn_v1.0.onnx",
+      "sha256": "PLACEHOLDER_face_detector_mtcnn_v1.0",
+      "format": "onnx_fp32",
+      "size_mb": 2,
+      "trained_on": ["WIDER FACE"],
+      "description": "MTCNN face detector for preprocessing — crops face regions before deepfake classification"
+    }
+  }
+}
