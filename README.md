@@ -90,6 +90,74 @@ Models are lazy-loaded. Importing `deepfake_detector` is fast, and the HuggingFa
 
 ---
 
+## Model Management
+
+Models are distributed via [HuggingFace Hub](https://huggingface.co/redsitesoftware/deepfake-detector-models) and downloaded automatically on first use.
+
+### Lazy auto-download
+
+```python
+import deepfake_detector
+import numpy as np
+
+frame = np.zeros((224, 224, 3), dtype=np.uint8)
+# Model is fetched from HF Hub on first call and cached to
+# ~/.cache/deepfake_detector/models/
+result = deepfake_detector.detect_frame(frame, model_version="v1.0")
+```
+
+### Manual download / pre-warming
+
+```python
+from deepfake_detector.models import download, get_model_path
+
+# Download and cache a specific model
+path = download("efficientnet_b4_deepfake", version="v1.0")
+
+# Or resolve path (downloading if needed)
+path = get_model_path("efficientnet_b4_deepfake")
+```
+
+### Model registry
+
+```python
+from deepfake_detector.models import MODEL_REGISTRY, get_model_info
+
+info = get_model_info("efficientnet_b4_deepfake", "v1.0")
+print(info.hf_repo, info.filename, info.sha256)
+```
+
+The registry is backed by `models/manifest.json`.  Add new models there and mirror the entry in `deepfake_detector/models/registry.py`.
+
+### CI / Docker pre-download
+
+```bash
+# Pre-download all registered models (exits non-zero on failure — CI-safe)
+python scripts/download_models.py
+
+# Selective download
+python scripts/download_models.py --models efficientnet_b4_deepfake,face_detector_mtcnn
+
+# Custom cache dir
+python scripts/download_models.py --cache-dir /opt/models
+```
+
+### ONNX export
+
+Export a trained PyTorch checkpoint to ONNX (fp32 + fp16):
+
+```bash
+python scripts/export_onnx.py \
+    --checkpoint path/to/weights.pt \
+    --model-name efficientnet_b4_deepfake \
+    --version v1.0
+# → models/efficientnet_b4_v1.0.onnx  (fp32)
+# → models/efficientnet_b4_v1.0_fp16.onnx  (fp16)
+# Prints SHA256 checksums to paste into models/manifest.json
+```
+
+---
+
 ## Development
 
 ```bash
