@@ -292,7 +292,8 @@ def main() -> int:
         return 1
 
     # ── detector ────────────────────────────────────────────────────────────
-    detector = None
+    detector     = None
+    raw_detector = None
     if not args.no_detector:
         _repo = Path(__file__).resolve().parent.parent
         if str(_repo) not in sys.path:
@@ -300,7 +301,8 @@ def main() -> int:
         try:
             print("[detector] Loading deepfake detector…")
             from deepfake_detector import Detector
-            detector = Detector()
+            detector     = Detector()   # scores the output (swapped or real)
+            raw_detector = Detector()   # always scores the raw camera feed
             print("[detector] Ready ✓")
         except Exception as exc:
             print(f"[detector] Could not load ({exc}); swap-only mode.")
@@ -326,15 +328,19 @@ def main() -> int:
 
     raw_q      = queue.Queue(maxsize=QUEUE_MAX)   # cam  → swap worker
     swapped_q  = queue.Queue(maxsize=QUEUE_MAX)   # swap → display + detect
-    detect_q   = queue.Queue(maxsize=QUEUE_MAX)   # display → detect worker
+    detect_q   = queue.Queue(maxsize=QUEUE_MAX)   # output frames → detect worker
+    raw_det_q  = queue.Queue(maxsize=QUEUE_MAX)   # raw frames → raw detect worker
 
     swap_worker = _SwapWorker(swapper, raw_q, swapped_q, swap_flag, stop_flag)
     swap_worker.start()
 
-    detect_worker = None
+    detect_worker     = None
+    raw_detect_worker = None
     if detector is not None:
-        detect_worker = _DetectWorker(detector, detect_q, stop_flag)
+        detect_worker     = _DetectWorker(detector,     detect_q,  stop_flag)
+        raw_detect_worker = _DetectWorker(raw_detector, raw_det_q, stop_flag)
         detect_worker.start()
+        raw_detect_worker.start()
 
     print("\n── DLC Bridge running ──────────────────────────────────────────")
     print("  SPACE  toggle deepfake on/off")
@@ -359,6 +365,13 @@ def main() -> int:
             except queue.Full:
                 pass
 
+            # also push raw frame to the raw detector (always scores real feed)
+            if raw_detect_worker is not None:
+                try:
+                    raw_det_q.put_nowait(raw_frame)
+                except queue.Full:
+                    pass
+
             # Grab the latest swapped pair.  If the queue is empty (worker
             # is mid-processing) we HOLD the last known frame — never fall
             # back to raw_frame which causes real↔fake alternation.
@@ -379,25 +392,32 @@ def main() -> int:
                     pass
 
             # ── build display ────────────────────────────────────────────────
+            # Left panel: raw feed + its own detection score
+            raw_disp = raw_display.copy()
+            if raw_detect_worker is not None:
+                raw_result, _ = raw_detect_worker.get_result()
+                _draw_detection_overlay(raw_disp, raw_result, swap_on=False)
+
+            # Right panel: output feed + output detection score
             out_display = out_frame.copy()
+            swap_on = swap_flag.is_set()
             if detect_worker is not None:
                 result, detect_ms = detect_worker.get_result()
-                _draw_detection_overlay(out_display, result, swap_flag.is_set())
+                _draw_detection_overlay(out_display, result, swap_on)
             else:
                 detect_ms = 0.0
 
             ph    = DISPLAY_H
             scale = ph / raw_display.shape[0]
             pw    = int(raw_display.shape[1] * scale)
-            left  = cv2.resize(raw_display, (pw, ph))
-            right = cv2.resize(out_display, (pw, ph))
+            left  = cv2.resize(raw_disp,     (pw, ph))
+            right = cv2.resize(out_display,  (pw, ph))
 
-            cv2.putText(left, "RAW", (8, 20),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, _GREY, 1, cv2.LINE_AA)
-            swap_on = swap_flag.is_set()
+            cv2.putText(left, "YOU (raw)", (8, 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, _GREY, 1, cv2.LINE_AA)
             cv2.putText(right,
-                        "DEEPFAKE (ON)" if swap_on else "REAL (swap off)",
-                        (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                        "DEEPFAKE (ON)" if swap_on else "OUTPUT (swap off)",
+                        (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
                         _RED if swap_on else _GREEN, 1, cv2.LINE_AA)
 
             divider = np.full((ph, 4, 3), 60, dtype=np.uint8)
@@ -449,6 +469,7 @@ def main() -> int:
                     if detect_worker is not None:
                         with detect_worker._lock:
                             detect_worker.result = None
+                # raw detector keeps its state — it always sees the real face
 
                 print(f"[bridge] Swap {label}")
 
