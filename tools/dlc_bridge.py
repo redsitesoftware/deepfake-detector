@@ -58,9 +58,9 @@ def _bar(frame, x, y, w, h, value, colour):
 
 
 def _draw_detection_overlay(frame, result, embed_score, warmup_progress, swap_on):
-    pad, panel_w, panel_h = 10, 235, 130
+    pad, panel_w, panel_h = 10, 240, 110
 
-    # Warmup phase (building reference window — no enroll needed)
+    # Warmup phase
     if warmup_progress < 1.0:
         overlay = frame.copy()
         cv2.rectangle(overlay, (pad, pad), (pad + panel_w, pad + 50), _BLACK, -1)
@@ -71,19 +71,17 @@ def _draw_detection_overlay(frame, result, embed_score, warmup_progress, swap_on
         _bar(frame, pad + 8, pad + 30, panel_w - 20, 8, warmup_progress, _YELLOW)
         return
 
-    # Identity drift drives the verdict
-    id_score = embed_score if embed_score is not None else 0.0
-    s        = (result.signals or {}) if result else {}
+    # Embed score is the sole decider when available; fall back to temporal only
+    # if face wasn't detected (embed_score is None).
+    if embed_score is not None:
+        conf    = embed_score
+        src_lbl = "embed"
+    else:
+        s       = (result.signals or {}) if result else {}
+        conf    = s.get("temporal", 0.0) or 0.0
+        src_lbl = "temporal"
 
-    temporal = s.get("temporal")
-    liveness = s.get("liveness")
-    scores   = [(id_score, 0.60)]
-    if temporal is not None: scores.append((temporal, 0.25))
-    if liveness is not None: scores.append((liveness, 0.15))
-    total_w  = sum(w for _, w in scores)
-    conf     = sum(v * w for v, w in scores) / total_w
-    is_fake  = conf > 0.50
-
+    is_fake = conf > 0.50
     vc      = _RED if is_fake else _GREEN
     verdict = f"{'FAKE' if is_fake else 'REAL'}  {conf:.2f}"
 
@@ -95,22 +93,24 @@ def _draw_detection_overlay(frame, result, embed_score, warmup_progress, swap_on
                 cv2.FONT_HERSHEY_DUPLEX, 0.85, vc, 2, cv2.LINE_AA)
     _bar(frame, pad + 8, pad + 34, panel_w - 20, 8, conf, vc)
 
-    signals = [
-        ("ID drift", embed_score),
-        ("Temporal", temporal),
-        ("Liveness", liveness),
-    ]
-    for i, (name, score) in enumerate(signals):
-        yb = pad + 58 + i * 22
-        cv2.putText(frame, f"{name}:", (pad + 8, yb),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, _WHITE, 1, cv2.LINE_AA)
-        if score is not None:
-            _bar(frame, pad + 88, yb - 10, 80, 7, score, vc)
-            cv2.putText(frame, f"{score:.2f}", (pad + 176, yb),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, _WHITE, 1, cv2.LINE_AA)
-        else:
-            cv2.putText(frame, "wait…", (pad + 88, yb),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, _GREY, 1, cv2.LINE_AA)
+    cv2.putText(frame, f"via {src_lbl}", (pad + 8, pad + 55),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.38, _GREY, 1, cv2.LINE_AA)
+
+    # Sub-signals for debugging
+    signals = [("Spike", None), ("NN drift", None)]  # filled via embed internals
+    if embed_score is not None:
+        pass  # composite score already shown
+    else:
+        s = (result.signals or {}) if result else {}
+        for i, (name, key) in enumerate([("Temporal", "temporal"), ("Liveness", "liveness")]):
+            score = s.get(key)
+            yb    = pad + 72 + i * 20
+            cv2.putText(frame, f"{name}:", (pad + 8, yb),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.40, _GREY, 1, cv2.LINE_AA)
+            if score is not None:
+                _bar(frame, pad + 88, yb - 9, 70, 6, score, _GREY)
+                cv2.putText(frame, f"{score:.2f}", (pad + 165, yb),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.40, _GREY, 1, cv2.LINE_AA)
 
 
 def _draw_status_bar(canvas, swap_on, fps, detect_ms, show_picker_hint=False):
@@ -258,45 +258,57 @@ class _EmbeddingVarianceDetector:
 
     Two complementary signals:
 
-    1. SPIKE detection (catches the transition moment):
-       Track frame-to-frame cosine distances in a rolling baseline window.
-       A face swap causes a sudden z-score spike (anomalously large jump).
-       Score stays 'sticky' for STICKY_SECS after a spike, then decays.
+    1. SPIKE detection (transition moment):
+       Tracks rolling baseline of consecutive frame-to-frame embedding distances.
+       A face swap causes a sudden anomalous jump (z > SPIKE_K σ above baseline).
+       Score decays linearly over STICKY_SECS after the last spike.
+       Robust to head movement because it measures *relative* change only.
 
-    2. NEAREST-NEIGHBOUR drift (catches sustained identity change):
-       Compare current embedding to the *closest* reference frame from
-       DELAY_LOW..DELAY_HIGH frames ago (best-matching pose). This is
-       robust to head movement: if you tilted your head, some reference
-       frame had the same tilt — the NN search finds it.
-       A different person has no close match at all → high drift score.
+    2. NEAREST-NEIGHBOUR drift with ADAPTIVE THRESHOLD (sustained identity):
+       Compares current embedding to the closest match in the reference zone
+       (DELAY_LOW..DELAY_HIGH frames ago). The NN search is pose-robust —
+       if any reference frame had a similar head angle, it will match.
+       Threshold is NOT hardcoded: it's learned from observed NN similarities
+       during non-spike periods (mean − 2.5σ), so it adapts to the actual face.
+       Real face: best_sim consistently near ~0.92-0.99 → low fake score.
+       Swap: best_sim drops to ~0.20-0.60 → high fake score.
 
-    Combining both avoids false positives from natural head movement (drift)
-    while still catching swaps that happened > STICKY_SECS ago (NN).
+    Terminal logs every ~2s show: best_sim, adaptive threshold, and verdict.
     """
-    REF_SIZE     = 90    # total history kept
-    DELAY_LOW    = 15    # reference zone: start (frames ago)
-    DELAY_HIGH   = 60    # reference zone: end (frames ago)
-    SPIKE_WIN    = 30    # rolling window for spike baseline
-    SPIKE_K      = 3.0   # std devs above baseline = spike
-    STICKY_SECS  = 5.0   # seconds to hold FAKE after a spike
+    REF_SIZE    = 90
+    DELAY_LOW   = 10
+    DELAY_HIGH  = 60
+    SPIKE_WIN   = 25
+    SPIKE_K     = 3.5   # raised from 3.0 — fewer false spikes on head movement
+    STICKY_SECS = 5.0
 
     def __init__(self, detect_one_face_fn):
-        self._detect    = detect_one_face_fn
-        self._history:  collections.deque[np.ndarray] = collections.deque(maxlen=self.REF_SIZE)
-        self._dists:    collections.deque[float]       = collections.deque(maxlen=self.SPIKE_WIN)
-        self._last_emb: np.ndarray | None = None
+        self._detect      = detect_one_face_fn
+        self._history:    collections.deque[np.ndarray] = collections.deque(maxlen=self.REF_SIZE)
+        self._dists:      collections.deque[float]       = collections.deque(maxlen=self.SPIKE_WIN)
+        self._sim_hist:   collections.deque[float]       = collections.deque(maxlen=200)
+        self._last_emb:   np.ndarray | None = None
         self._last_spike_t: float = -999.0
+        self._log_t:      float   = 0.0
 
     @property
     def warmup_progress(self) -> float:
-        # Need DELAY_HIGH valid embeddings before NN drift is usable
         return min(1.0, len(self._history) / self.DELAY_HIGH)
 
     def reset(self):
         self._history.clear()
         self._dists.clear()
-        self._last_emb    = None
+        self._sim_hist.clear()
+        self._last_emb     = None
         self._last_spike_t = -999.0
+
+    def _adaptive_thresh(self) -> float:
+        """Learned threshold: mean(observed sims) − 2.5σ.  Floor at 0.50."""
+        if len(self._sim_hist) < 15:
+            return 0.72   # conservative fallback before enough data
+        mu = float(np.mean(self._sim_hist))
+        sd = float(np.std(self._sim_hist))
+        return float(max(0.50, mu - 2.5 * sd))
 
     def update(self, frame: np.ndarray) -> float | None:
         """Returns fake score 0–1, or None during warmup."""
@@ -310,46 +322,54 @@ class _EmbeddingVarianceDetector:
             return None
         emb /= norm
 
-        # ── spike detection (consecutive distance) ────────────────────────────
-        spike_score = 0.0
+        # ── spike (frame-to-frame z-score) ────────────────────────────────────
         if self._last_emb is not None:
             d = float(1.0 - np.dot(self._last_emb, emb))
-            if len(self._dists) >= 10:
+            if len(self._dists) >= 8:
                 mu = float(np.mean(self._dists))
-                sd = float(np.std(self._dists))  + 1e-6
+                sd = float(np.std(self._dists)) + 1e-6
                 z  = (d - mu) / sd
                 if z > self.SPIKE_K:
                     self._last_spike_t = time.monotonic()
-                    print(f"[embed] SPIKE z={z:.1f} d={d:.4f} mu={mu:.4f}")
+                    print(f"[embed] SPIKE z={z:.1f}  d={d:.4f}  baseline μ={mu:.4f}")
             self._dists.append(d)
         self._last_emb = emb
-
         self._history.append(emb)
 
-        # Sticky: score decays linearly from 1→0 over STICKY_SECS
-        age = time.monotonic() - self._last_spike_t
+        age         = time.monotonic() - self._last_spike_t
         spike_score = float(max(0.0, 1.0 - age / self.STICKY_SECS))
 
-        # ── NN drift detection (needs full warmup) ────────────────────────────
         if len(self._history) < self.DELAY_HIGH:
-            # Still warming up: return spike-only score (or None)
-            return spike_score if spike_score > 0.0 else None
+            return spike_score if spike_score > 0.01 else None
 
+        # ── NN drift (adaptive threshold) ─────────────────────────────────────
         hist = list(self._history)
         n    = len(hist)
         ref  = hist[max(0, n - self.DELAY_HIGH) : n - self.DELAY_LOW]
         if len(ref) < 5:
-            return spike_score if spike_score > 0.0 else None
+            return spike_score if spike_score > 0.01 else None
 
-        # Nearest-neighbour: find the most similar reference frame
-        sims     = np.array([float(np.dot(r, emb)) for r in ref])
-        best_sim = float(sims.max())
-        # best_sim ~0.92-0.99 same person, ~0.20-0.60 different person
-        # Sigmoid midpoint at 0.75 (conservative — real faces are very close to themselves)
-        nn_score = float(1.0 / (1.0 + np.exp(20.0 * (best_sim - 0.75))))
+        best_sim = float(max(np.dot(r, emb) for r in ref))
+        thresh   = self._adaptive_thresh()
 
-        # Take the higher of spike or NN
-        return float(np.clip(max(spike_score, nn_score), 0.0, 1.0))
+        # Update adaptive threshold only when NOT in a spike (avoid learning swap face)
+        if spike_score < 0.20:
+            self._sim_hist.append(best_sim)
+
+        # Sigmoid centred at adaptive threshold
+        nn_score = float(1.0 / (1.0 + np.exp(25.0 * (best_sim - thresh))))
+
+        score = float(np.clip(max(spike_score, nn_score), 0.0, 1.0))
+
+        # Terminal log every ~2s
+        now = time.monotonic()
+        if now - self._log_t > 2.0:
+            self._log_t = now
+            verdict = "FAKE" if score > 0.50 else "REAL"
+            print(f"[embed] {verdict:4s}  best_sim={best_sim:.3f}  "
+                  f"thresh={thresh:.3f}  nn={nn_score:.2f}  spike={spike_score:.2f}")
+
+        return score
 
 
 class _DetectWorker(threading.Thread):
