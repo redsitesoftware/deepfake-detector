@@ -14,6 +14,7 @@ from deepfake_detector.types import DetectionResult
 from deepfake_detector.utils.face import detect_face
 
 MODEL_VERSION = "v0.1-bootstrap"
+_DEFAULT_MODEL_NAME = "efficientnet_b4_deepfake"
 FrameCallback = Callable[[DetectionResult], None]
 
 
@@ -114,7 +115,21 @@ class Detector:
         )
 
 
-def detect_frame(frame: np.ndarray) -> DetectionResult:
+def detect_frame(frame: np.ndarray, model_version: str = "v1.0") -> DetectionResult:
+    """Analyse a single frame, lazily downloading the model on first call.
+
+    Args:
+        frame: BGR image as a NumPy array.
+        model_version: Version tag for the pretrained weights (default ``'v1.0'``).
+            The model is downloaded from HuggingFace Hub and cached locally on
+            first use.
+
+    Returns:
+        :class:`~deepfake_detector.types.DetectionResult`
+    """
+    from deepfake_detector.models import get_model_path  # lazy import to avoid circular
+
+    get_model_path(_DEFAULT_MODEL_NAME, version=model_version)
     detector = Detector()
     try:
         return detector.analyse(frame)
