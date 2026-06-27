@@ -254,40 +254,49 @@ class _SwapWorker(threading.Thread):
 
 
 class _EmbeddingVarianceDetector:
-    """Detect face swap by comparing current embedding to a delayed reference window.
+    """Detect face swap without a reference image — works on any face.
 
-    No reference image needed — works on any unknown face.
+    Two complementary signals:
 
-    Strategy:
-      Keep a rolling history of HISTORY_SIZE normalised face embeddings.
-      Compare the current embedding against the mean of frames DELAY_LOW..DELAY_HIGH
-      ago (the 'reference zone'). This zone is far enough back that:
-        • It still reflects the *pre-swap* identity for ~3 seconds after a toggle.
-        • It naturally drifts to the new identity if the same face persists.
+    1. SPIKE detection (catches the transition moment):
+       Track frame-to-frame cosine distances in a rolling baseline window.
+       A face swap causes a sudden z-score spike (anomalously large jump).
+       Score stays 'sticky' for STICKY_SECS after a spike, then decays.
 
-    Cosine distances:
-      Same person across frames : ~0.01–0.08
-      Different person (swap)   : ~0.30–0.80
-      Sigmoid midpoint at 0.15  → clean separation
+    2. NEAREST-NEIGHBOUR drift (catches sustained identity change):
+       Compare current embedding to the *closest* reference frame from
+       DELAY_LOW..DELAY_HIGH frames ago (best-matching pose). This is
+       robust to head movement: if you tilted your head, some reference
+       frame had the same tilt — the NN search finds it.
+       A different person has no close match at all → high drift score.
+
+    Combining both avoids false positives from natural head movement (drift)
+    while still catching swaps that happened > STICKY_SECS ago (NN).
     """
-    HISTORY_SIZE = 60   # frames of history to keep
-    DELAY_LOW    = 15   # reference zone lower bound (frames ago)
-    DELAY_HIGH   = 45   # reference zone upper bound
-    WARMUP       = 45   # frames before first valid score (must match DELAY_HIGH)
+    REF_SIZE     = 90    # total history kept
+    DELAY_LOW    = 15    # reference zone: start (frames ago)
+    DELAY_HIGH   = 60    # reference zone: end (frames ago)
+    SPIKE_WIN    = 30    # rolling window for spike baseline
+    SPIKE_K      = 3.0   # std devs above baseline = spike
+    STICKY_SECS  = 5.0   # seconds to hold FAKE after a spike
 
     def __init__(self, detect_one_face_fn):
-        self._detect  = detect_one_face_fn
-        self._history: collections.deque[np.ndarray] = collections.deque(maxlen=self.HISTORY_SIZE)
-        self._frame_n = 0
+        self._detect    = detect_one_face_fn
+        self._history:  collections.deque[np.ndarray] = collections.deque(maxlen=self.REF_SIZE)
+        self._dists:    collections.deque[float]       = collections.deque(maxlen=self.SPIKE_WIN)
+        self._last_emb: np.ndarray | None = None
+        self._last_spike_t: float = -999.0
 
     @property
     def warmup_progress(self) -> float:
-        # Ready when we have enough history to fill the reference zone
+        # Need DELAY_HIGH valid embeddings before NN drift is usable
         return min(1.0, len(self._history) / self.DELAY_HIGH)
 
     def reset(self):
         self._history.clear()
-        self._frame_n = 0
+        self._dists.clear()
+        self._last_emb    = None
+        self._last_spike_t = -999.0
 
     def update(self, frame: np.ndarray) -> float | None:
         """Returns fake score 0–1, or None during warmup."""
@@ -299,31 +308,48 @@ class _EmbeddingVarianceDetector:
         norm = np.linalg.norm(emb)
         if norm < 1e-6:
             return None
-        emb = emb / norm
+        emb /= norm
+
+        # ── spike detection (consecutive distance) ────────────────────────────
+        spike_score = 0.0
+        if self._last_emb is not None:
+            d = float(1.0 - np.dot(self._last_emb, emb))
+            if len(self._dists) >= 10:
+                mu = float(np.mean(self._dists))
+                sd = float(np.std(self._dists))  + 1e-6
+                z  = (d - mu) / sd
+                if z > self.SPIKE_K:
+                    self._last_spike_t = time.monotonic()
+                    print(f"[embed] SPIKE z={z:.1f} d={d:.4f} mu={mu:.4f}")
+            self._dists.append(d)
+        self._last_emb = emb
 
         self._history.append(emb)
-        self._frame_n += 1
 
-        if self._frame_n < self.WARMUP:
-            return None
+        # Sticky: score decays linearly from 1→0 over STICKY_SECS
+        age = time.monotonic() - self._last_spike_t
+        spike_score = float(max(0.0, 1.0 - age / self.STICKY_SECS))
+
+        # ── NN drift detection (needs full warmup) ────────────────────────────
+        if len(self._history) < self.DELAY_HIGH:
+            # Still warming up: return spike-only score (or None)
+            return spike_score if spike_score > 0.0 else None
 
         hist = list(self._history)
         n    = len(hist)
-        # Reference zone: DELAY_LOW..DELAY_HIGH frames before current
-        ref_slice = hist[max(0, n - self.DELAY_HIGH) : n - self.DELAY_LOW]
-        if len(ref_slice) < 5:
-            return None
+        ref  = hist[max(0, n - self.DELAY_HIGH) : n - self.DELAY_LOW]
+        if len(ref) < 5:
+            return spike_score if spike_score > 0.0 else None
 
-        ref_mean = np.mean(ref_slice, axis=0)
-        ref_norm = np.linalg.norm(ref_mean)
-        if ref_norm < 1e-6:
-            return None
-        ref_mean /= ref_norm
+        # Nearest-neighbour: find the most similar reference frame
+        sims     = np.array([float(np.dot(r, emb)) for r in ref])
+        best_sim = float(sims.max())
+        # best_sim ~0.92-0.99 same person, ~0.20-0.60 different person
+        # Sigmoid midpoint at 0.75 (conservative — real faces are very close to themselves)
+        nn_score = float(1.0 / (1.0 + np.exp(20.0 * (best_sim - 0.75))))
 
-        # Cosine distance 0=same, 2=opposite. Real face ~0.02-0.08, swap ~0.30-0.80
-        dist       = float(1.0 - np.dot(ref_mean, emb))
-        fake_score = 1.0 / (1.0 + np.exp(-30.0 * (dist - 0.15)))
-        return float(np.clip(fake_score, 0.0, 1.0))
+        # Take the higher of spike or NN
+        return float(np.clip(max(spike_score, nn_score), 0.0, 1.0))
 
 
 class _DetectWorker(threading.Thread):
