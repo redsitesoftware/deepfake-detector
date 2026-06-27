@@ -271,9 +271,9 @@ class _EmbeddingVarianceDetector:
       Sigmoid midpoint at 0.15  → clean separation
     """
     HISTORY_SIZE = 60   # frames of history to keep
-    DELAY_LOW    = 20   # reference zone lower bound (frames ago)
-    DELAY_HIGH   = 50   # reference zone upper bound
-    WARMUP       = 50   # frames before first valid score
+    DELAY_LOW    = 15   # reference zone lower bound (frames ago)
+    DELAY_HIGH   = 45   # reference zone upper bound
+    WARMUP       = 45   # frames before first valid score (must match DELAY_HIGH)
 
     def __init__(self, detect_one_face_fn):
         self._detect  = detect_one_face_fn
@@ -282,7 +282,8 @@ class _EmbeddingVarianceDetector:
 
     @property
     def warmup_progress(self) -> float:
-        return min(1.0, self._frame_n / self.WARMUP)
+        # Ready when we have enough history to fill the reference zone
+        return min(1.0, len(self._history) / self.DELAY_HIGH)
 
     def reset(self):
         self._history.clear()
@@ -555,9 +556,11 @@ def main() -> int:
         return 1
 
     # ── embedding detectors (uses insightface already loaded by swapper) ─────
-    from modules.face_analyser import detect_one_face_fast
-    embed_out = _EmbeddingVarianceDetector(detect_one_face_fast)  # scores output feed
-    embed_raw = _EmbeddingVarianceDetector(detect_one_face_fast)  # always scores raw feed
+    # Must use get_one_face (full pipeline) — detect_one_face_fast skips the
+    # recognition model and returns Face objects without .embedding.
+    from modules.face_analyser import get_one_face as _get_one_face_full
+    embed_out = _EmbeddingVarianceDetector(_get_one_face_full)  # scores output feed
+    embed_raw = _EmbeddingVarianceDetector(_get_one_face_full)  # always scores raw feed
 
     # ── thread plumbing ──────────────────────────────────────────────────────
     swap_flag  = threading.Event()   # set = deepfake ON
