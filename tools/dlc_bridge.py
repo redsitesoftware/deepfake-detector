@@ -91,14 +91,15 @@ def _draw_detection_overlay(frame, result, swap_on):
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, _GREY, 1, cv2.LINE_AA)
 
 
-def _draw_status_bar(canvas, swap_on, fps, detect_ms):
+def _draw_status_bar(canvas, swap_on, fps, detect_ms, show_picker_hint=False):
     h, w = canvas.shape[:2]
     cv2.rectangle(canvas, (0, h - 28), (w, h), (30, 30, 30), -1)
     sc = _GREEN if swap_on else _GREY
     cv2.putText(canvas, "SWAP: ON" if swap_on else "SWAP: OFF",
                 (10, h - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.55, sc, 1, cv2.LINE_AA)
-    cv2.putText(canvas, "[SPACE] toggle  [Q] quit",
-                (120, h - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.45, _GREY, 1, cv2.LINE_AA)
+    hint = "[SPACE] toggle  [G] pick face  [Q] quit" if show_picker_hint else "[SPACE] toggle  [Q] quit"
+    cv2.putText(canvas, hint,
+                (120, h - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.40, _GREY, 1, cv2.LINE_AA)
     info = f"FPS: {fps:.1f}  det: {detect_ms:.0f}ms"
     cv2.putText(canvas, info, (w - 170, h - 8),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.45, _WHITE, 1, cv2.LINE_AA)
@@ -158,6 +159,19 @@ class _DLCSwapper:
         if self._source_face is None:
             raise ValueError(f"No face found in source image: {source_img_path}")
         print(f"[dlc] Source face loaded ✓  ({Path(source_img_path).name})")
+
+    def load_source(self, source_img_path: str) -> bool:
+        """Hot-swap the source face. Returns True on success."""
+        from modules import imread_unicode
+        from modules.face_analyser import get_one_face
+        src  = imread_unicode(source_img_path)
+        face = get_one_face(src)
+        if face is None:
+            print(f"[dlc] No face found in {Path(source_img_path).name}")
+            return False
+        self._source_face = face
+        print(f"[dlc] Source face updated ✓  ({Path(source_img_path).name})")
+        return True
 
     def swap(self, frame: np.ndarray) -> np.ndarray:
         target_face = self._detect_one(frame)
@@ -264,6 +278,105 @@ class _DetectWorker(threading.Thread):
             return self.result, self.detect_ms
 
 
+# ── image picker grid ─────────────────────────────────────────────────────────
+
+_IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+
+
+def _scan_images(directory: str) -> list[Path]:
+    return sorted(
+        p for p in Path(directory).iterdir()
+        if p.suffix.lower() in _IMG_EXTS
+    )
+
+
+def _show_picker(directory: str, current: str | None = None) -> str | None:
+    """Show a clickable grid of images from *directory*.
+    Returns the selected path string, or None if cancelled (ESC/Q).
+    """
+    images = _scan_images(directory)
+    if not images:
+        print(f"[picker] No images found in {directory}")
+        return None
+
+    COLS      = 4
+    THUMB     = 160   # thumbnail size (square)
+    PAD       = 8
+    LABEL_H   = 20
+    CELL      = THUMB + PAD * 2
+    CELL_H    = THUMB + PAD * 2 + LABEL_H
+    rows      = (len(images) + COLS - 1) // COLS
+    win_w     = COLS * CELL
+    win_h     = rows * CELL_H + 40   # +40 for header
+
+    canvas = np.zeros((win_h, win_w, 3), dtype=np.uint8)
+
+    # header
+    cv2.putText(canvas, "Select source face  [G/ESC = cancel]",
+                (PAD, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.55, _WHITE, 1, cv2.LINE_AA)
+
+    thumbs: list[np.ndarray] = []
+    for img_path in images:
+        try:
+            img = cv2.imread(str(img_path))
+            if img is None:
+                img = np.zeros((THUMB, THUMB, 3), dtype=np.uint8)
+            img = cv2.resize(img, (THUMB, THUMB), interpolation=cv2.INTER_AREA)
+        except Exception:
+            img = np.zeros((THUMB, THUMB, 3), dtype=np.uint8)
+        thumbs.append(img)
+
+    selected: list[str | None] = [None]
+    done = threading.Event()
+
+    def _render(highlight: int = -1) -> np.ndarray:
+        c = canvas.copy()
+        for idx, (img_path, thumb) in enumerate(zip(images, thumbs)):
+            col = idx % COLS
+            row = idx // COLS
+            x   = col * CELL + PAD
+            y   = row * CELL_H + 40 + PAD
+            c[y:y + THUMB, x:x + THUMB] = thumb
+            is_current  = str(img_path) == current
+            is_highlight = idx == highlight
+            colour = _GREEN if is_current else (_YELLOW if is_highlight else _GREY)
+            cv2.rectangle(c, (x - 2, y - 2), (x + THUMB + 2, y + THUMB + 2), colour, 2)
+            label = img_path.stem[:18]
+            cv2.putText(c, label, (x, y + THUMB + LABEL_H - 4),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.38, _WHITE, 1, cv2.LINE_AA)
+        return c
+
+    win = "Face Picker"
+    cv2.namedWindow(win)
+    hover_idx = [-1]
+
+    def _mouse(event, mx, my, flags, param):
+        if my < 40:
+            hover_idx[0] = -1
+            return
+        col = mx // CELL
+        row = (my - 40) // CELL_H
+        idx = row * COLS + col
+        if 0 <= idx < len(images):
+            hover_idx[0] = idx
+            if event == cv2.EVENT_LBUTTONDOWN:
+                selected[0] = str(images[idx])
+                done.set()
+        else:
+            hover_idx[0] = -1
+
+    cv2.setMouseCallback(win, _mouse)
+
+    while not done.is_set():
+        cv2.imshow(win, _render(hover_idx[0]))
+        key = cv2.waitKey(30) & 0xFF
+        if key in (ord("g"), ord("G"), ord("q"), ord("Q"), 27):
+            break
+
+    cv2.destroyWindow(win)
+    return selected[0]
+
+
 # ── main ──────────────────────────────────────────────────────────────────────
 
 def main() -> int:
@@ -271,8 +384,10 @@ def main() -> int:
         description="Live DLC → deepfake-detector bridge with toggle",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--source", required=True,
-                        help="Path to the source face image (e.g. marquez.jpg)")
+    parser.add_argument("--source", default=None,
+                        help="Path to a single source face image")
+    parser.add_argument("--source-dir", default=None,
+                        help="Directory of face images — opens a picker grid (press G to reopen)")
     parser.add_argument("--dlc",
                         default=str(Path.home() / "PROJECTS" / "Deep-Live-Cam"),
                         help="Path to the Deep-Live-Cam repository root")
@@ -284,9 +399,22 @@ def main() -> int:
                         help="Skip deepfake detector (swap preview only)")
     args = parser.parse_args()
 
-    if not Path(args.source).is_file():
-        print(f"ERROR: source image not found: {args.source}", file=sys.stderr)
+    # ── resolve source image ─────────────────────────────────────────────────
+    source_dir = args.source_dir
+    if source_dir and not Path(source_dir).is_dir():
+        print(f"ERROR: source-dir not found: {source_dir}", file=sys.stderr)
         return 1
+    if not args.source and not source_dir:
+        print("ERROR: provide --source or --source-dir", file=sys.stderr)
+        return 1
+
+    source_path: str | None = args.source
+    if source_dir and not source_path:
+        source_path = _show_picker(source_dir)
+        if not source_path:
+            print("No face selected — exiting.")
+            return 0
+
     if not Path(args.dlc).is_dir():
         print(f"ERROR: DLC path not found: {args.dlc}", file=sys.stderr)
         return 1
@@ -309,7 +437,7 @@ def main() -> int:
 
     # ── DLC swapper ──────────────────────────────────────────────────────────
     try:
-        swapper = _DLCSwapper(args.dlc, args.source)
+        swapper = _DLCSwapper(args.dlc, source_path)
     except Exception as exc:
         print(f"ERROR initialising DLC swapper: {exc}", file=sys.stderr)
         return 1
@@ -344,6 +472,8 @@ def main() -> int:
 
     print("\n── DLC Bridge running ──────────────────────────────────────────")
     print("  SPACE  toggle deepfake on/off")
+    if source_dir:
+        print("  G      open face picker grid")
     print("  Q/ESC  quit")
     print("────────────────────────────────────────────────────────────────\n")
 
@@ -431,7 +561,7 @@ def main() -> int:
 
             bar = np.zeros((28, canvas.shape[1], 3), dtype=np.uint8)
             canvas = np.vstack([canvas, bar])
-            _draw_status_bar(canvas, swap_on, fps, detect_ms)
+            _draw_status_bar(canvas, swap_on, fps, detect_ms, show_picker_hint=bool(source_dir))
 
             cv2.imshow("DLC Bridge — deepfake-detector", canvas)
 
@@ -472,6 +602,23 @@ def main() -> int:
                 # raw detector keeps its state — it always sees the real face
 
                 print(f"[bridge] Swap {label}")
+
+            elif source_dir and key in (ord("g"), ord("G")):
+                # Pause swap while picker is open
+                was_swapping = swap_flag.is_set()
+                swap_flag.clear()
+                new_path = _show_picker(source_dir, current=source_path)
+                if new_path and new_path != source_path:
+                    source_path = new_path
+                    swapper.load_source(source_path)
+                    # flush queues so first frame uses new face
+                    for q in (raw_q, swapped_q, detect_q):
+                        while not q.empty():
+                            try: q.get_nowait()
+                            except queue.Empty: break
+                    last_out_frame = last_raw_display = None
+                if was_swapping:
+                    swap_flag.set()
 
     finally:
         stop_flag.set()
