@@ -22,6 +22,7 @@ Controls
 from __future__ import annotations
 
 import argparse
+import collections
 import os
 import queue
 import sys
@@ -56,33 +57,32 @@ def _bar(frame, x, y, w, h, value, colour):
         cv2.rectangle(frame, (x, y), (x + filled, y + h), colour, -1)
 
 
-def _draw_detection_overlay(frame, result, embed_score, enroll_progress, swap_on):
+def _draw_detection_overlay(frame, result, embed_score, warmup_progress, swap_on):
     pad, panel_w, panel_h = 10, 235, 130
 
-    # Enrollment phase
-    if enroll_progress < 1.0:
+    # Warmup phase (building reference window — no enroll needed)
+    if warmup_progress < 1.0:
         overlay = frame.copy()
         cv2.rectangle(overlay, (pad, pad), (pad + panel_w, pad + 50), _BLACK, -1)
         cv2.addWeighted(overlay, 0.55, frame, 0.45, 0, frame)
-        pct = int(enroll_progress * 100)
-        cv2.putText(frame, f"ENROLLING real face… {pct}%", (pad + 8, pad + 22),
+        pct = int(warmup_progress * 100)
+        cv2.putText(frame, f"Calibrating… {pct}%", (pad + 8, pad + 22),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, _YELLOW, 1, cv2.LINE_AA)
-        _bar(frame, pad + 8, pad + 30, panel_w - 20, 8, enroll_progress, _YELLOW)
+        _bar(frame, pad + 8, pad + 30, panel_w - 20, 8, warmup_progress, _YELLOW)
         return
 
-    # Identity score drives the verdict (most reliable signal for face swaps)
-    id_score  = embed_score if embed_score is not None else 0.0
-    s         = (result.signals or {}) if result else {}
+    # Identity drift drives the verdict
+    id_score = embed_score if embed_score is not None else 0.0
+    s        = (result.signals or {}) if result else {}
 
-    # Blend identity with temporal for overall confidence
-    temporal  = s.get("temporal")
-    liveness  = s.get("liveness")
-    scores    = [(id_score, 0.60)]
-    if temporal  is not None: scores.append((temporal,  0.25))
-    if liveness  is not None: scores.append((liveness,  0.15))
-    total_w   = sum(w for _, w in scores)
-    conf      = sum(v * w for v, w in scores) / total_w
-    is_fake   = conf > 0.50
+    temporal = s.get("temporal")
+    liveness = s.get("liveness")
+    scores   = [(id_score, 0.60)]
+    if temporal is not None: scores.append((temporal, 0.25))
+    if liveness is not None: scores.append((liveness, 0.15))
+    total_w  = sum(w for _, w in scores)
+    conf     = sum(v * w for v, w in scores) / total_w
+    is_fake  = conf > 0.50
 
     vc      = _RED if is_fake else _GREEN
     verdict = f"{'FAKE' if is_fake else 'REAL'}  {conf:.2f}"
@@ -96,7 +96,7 @@ def _draw_detection_overlay(frame, result, embed_score, enroll_progress, swap_on
     _bar(frame, pad + 8, pad + 34, panel_w - 20, 8, conf, vc)
 
     signals = [
-        ("Identity", embed_score),
+        ("ID drift", embed_score),
         ("Temporal", temporal),
         ("Liveness", liveness),
     ]
@@ -253,32 +253,43 @@ class _SwapWorker(threading.Thread):
                     pass
 
 
-class _EmbeddingDetector:
-    """Enroll real face identity, detect if current face is a different person.
+class _EmbeddingVarianceDetector:
+    """Detect face swap by comparing current embedding to a delayed reference window.
 
-    Uses insightface face embeddings (already loaded for the swap pipeline).
-    Enrollment: first ENROLL_FRAMES frames with stable face detection.
-    Scoring: cosine distance between current embedding and enrolled identity.
+    No reference image needed — works on any unknown face.
+
+    Strategy:
+      Keep a rolling history of HISTORY_SIZE normalised face embeddings.
+      Compare the current embedding against the mean of frames DELAY_LOW..DELAY_HIGH
+      ago (the 'reference zone'). This zone is far enough back that:
+        • It still reflects the *pre-swap* identity for ~3 seconds after a toggle.
+        • It naturally drifts to the new identity if the same face persists.
+
+    Cosine distances:
+      Same person across frames : ~0.01–0.08
+      Different person (swap)   : ~0.30–0.80
+      Sigmoid midpoint at 0.15  → clean separation
     """
-    ENROLL_FRAMES = 30
+    HISTORY_SIZE = 60   # frames of history to keep
+    DELAY_LOW    = 20   # reference zone lower bound (frames ago)
+    DELAY_HIGH   = 50   # reference zone upper bound
+    WARMUP       = 50   # frames before first valid score
 
     def __init__(self, detect_one_face_fn):
         self._detect  = detect_one_face_fn
-        self._samples: list[np.ndarray] = []
-        self._enrolled: np.ndarray | None = None
+        self._history: collections.deque[np.ndarray] = collections.deque(maxlen=self.HISTORY_SIZE)
+        self._frame_n = 0
 
     @property
-    def enroll_progress(self) -> float:
-        if self._enrolled is not None:
-            return 1.0
-        return len(self._samples) / self.ENROLL_FRAMES
+    def warmup_progress(self) -> float:
+        return min(1.0, self._frame_n / self.WARMUP)
 
     def reset(self):
-        self._samples.clear()
-        self._enrolled = None
+        self._history.clear()
+        self._frame_n = 0
 
     def update(self, frame: np.ndarray) -> float | None:
-        """Returns fake score 0–1, or None if still enrolling."""
+        """Returns fake score 0–1, or None during warmup."""
         face = self._detect(frame)
         if face is None or not hasattr(face, "embedding") or face.embedding is None:
             return None
@@ -289,25 +300,35 @@ class _EmbeddingDetector:
             return None
         emb = emb / norm
 
-        if self._enrolled is None:
-            self._samples.append(emb)
-            if len(self._samples) >= self.ENROLL_FRAMES:
-                mean = np.mean(self._samples, axis=0)
-                self._enrolled = mean / np.linalg.norm(mean)
-                print(f"[embed] ✓ Real face enrolled ({self.ENROLL_FRAMES} frames)")
-            return None  # still enrolling
+        self._history.append(emb)
+        self._frame_n += 1
 
-        sim = float(np.dot(self._enrolled, emb))
-        # sim: ~0.6–0.95 same person, ~0.0–0.35 different person
-        # Sigmoid centred at threshold 0.40: score 0.5 at boundary
-        fake_score = 1.0 / (1.0 + np.exp(15.0 * (sim - 0.40)))
+        if self._frame_n < self.WARMUP:
+            return None
+
+        hist = list(self._history)
+        n    = len(hist)
+        # Reference zone: DELAY_LOW..DELAY_HIGH frames before current
+        ref_slice = hist[max(0, n - self.DELAY_HIGH) : n - self.DELAY_LOW]
+        if len(ref_slice) < 5:
+            return None
+
+        ref_mean = np.mean(ref_slice, axis=0)
+        ref_norm = np.linalg.norm(ref_mean)
+        if ref_norm < 1e-6:
+            return None
+        ref_mean /= ref_norm
+
+        # Cosine distance 0=same, 2=opposite. Real face ~0.02-0.08, swap ~0.30-0.80
+        dist       = float(1.0 - np.dot(ref_mean, emb))
+        fake_score = 1.0 / (1.0 + np.exp(-30.0 * (dist - 0.15)))
         return float(np.clip(fake_score, 0.0, 1.0))
 
 
 class _DetectWorker(threading.Thread):
     """Runs deepfake detector + embedding identity check every DETECT_EVERY frames."""
 
-    def __init__(self, detector, embed_detector: _EmbeddingDetector,
+    def __init__(self, detector, embed_detector: _EmbeddingVarianceDetector,
                  in_q: queue.Queue, stop_flag: threading.Event):
         super().__init__(daemon=True)
         self._detector       = detector
@@ -535,8 +556,8 @@ def main() -> int:
 
     # ── embedding detectors (uses insightface already loaded by swapper) ─────
     from modules.face_analyser import detect_one_face_fast
-    embed_out = _EmbeddingDetector(detect_one_face_fast)  # scores output feed
-    embed_raw = _EmbeddingDetector(detect_one_face_fast)  # always scores raw feed
+    embed_out = _EmbeddingVarianceDetector(detect_one_face_fast)  # scores output feed
+    embed_raw = _EmbeddingVarianceDetector(detect_one_face_fast)  # always scores raw feed
 
     # ── thread plumbing ──────────────────────────────────────────────────────
     swap_flag  = threading.Event()   # set = deepfake ON
@@ -616,7 +637,7 @@ def main() -> int:
             if raw_detect_worker is not None:
                 raw_result, raw_embed, _ = raw_detect_worker.get_result()
                 _draw_detection_overlay(raw_disp, raw_result, raw_embed,
-                                        embed_raw.enroll_progress, swap_on=False)
+                                        embed_raw.warmup_progress, swap_on=False)
 
             # Right panel: output feed + output detection score
             out_display = out_frame.copy()
@@ -624,7 +645,7 @@ def main() -> int:
             if detect_worker is not None:
                 result, out_embed, detect_ms = detect_worker.get_result()
                 _draw_detection_overlay(out_display, result, out_embed,
-                                        embed_out.enroll_progress, swap_on)
+                                        embed_out.warmup_progress, swap_on)
             else:
                 detect_ms = 0.0
 
