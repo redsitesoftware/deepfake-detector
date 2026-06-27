@@ -342,6 +342,8 @@ def main() -> int:
     print("────────────────────────────────────────────────────────────────\n")
 
     frame_times: list[float] = []
+    last_out_frame:   np.ndarray | None = None   # held across empty-queue frames
+    last_raw_display: np.ndarray | None = None
 
     try:
         while True:
@@ -357,13 +359,17 @@ def main() -> int:
             except queue.Full:
                 pass
 
-            # grab latest swapped pair (non-blocking, use last if empty)
-            raw_display = raw_frame
-            out_frame   = raw_frame
+            # Grab the latest swapped pair.  If the queue is empty (worker
+            # is mid-processing) we HOLD the last known frame — never fall
+            # back to raw_frame which causes real↔fake alternation.
             try:
-                raw_display, out_frame = swapped_q.get_nowait()
+                last_raw_display, last_out_frame = swapped_q.get_nowait()
             except queue.Empty:
-                pass
+                pass   # keep last_out_frame / last_raw_display
+
+            # Bootstrap: before the first frame arrives show the camera feed
+            raw_display = last_raw_display if last_raw_display is not None else raw_frame
+            out_frame   = last_out_frame   if last_out_frame   is not None else raw_frame
 
             # push output to detect worker (non-blocking)
             if detect_worker is not None:
@@ -428,6 +434,12 @@ def main() -> int:
                             q.get_nowait()
                         except queue.Empty:
                             break
+
+                # Snap the held display frame to the current raw camera
+                # image so we instantly show the correct state while
+                # waiting for the first worker frame in the new state.
+                last_out_frame   = raw_frame.copy()
+                last_raw_display = raw_frame.copy()
 
                 # Reset detector temporal/liveness buffers so stale
                 # pre-toggle signal history doesn't bleed into new state.
