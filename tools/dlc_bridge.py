@@ -571,8 +571,7 @@ def main() -> int:
         return 1
 
     # ── detector ────────────────────────────────────────────────────────────
-    detector     = None
-    raw_detector = None
+    detector = None
     if not args.no_detector:
         _repo = Path(__file__).resolve().parent.parent
         if str(_repo) not in sys.path:
@@ -580,8 +579,7 @@ def main() -> int:
         try:
             print("[detector] Loading deepfake detector…")
             from deepfake_detector import Detector
-            detector     = Detector()   # scores the output (swapped or real)
-            raw_detector = Detector()   # always scores the raw camera feed
+            detector = Detector()
             print("[detector] Ready ✓")
         except Exception as exc:
             print(f"[detector] Could not load ({exc}); swap-only mode.")
@@ -606,7 +604,6 @@ def main() -> int:
     # recognition model and returns Face objects without .embedding.
     from modules.face_analyser import get_one_face as _get_one_face_full
     embed_out = _EmbeddingVarianceDetector(_get_one_face_full)  # scores output feed
-    embed_raw = _EmbeddingVarianceDetector(_get_one_face_full)  # always scores raw feed
 
     # ── thread plumbing ──────────────────────────────────────────────────────
     swap_flag  = threading.Event()   # set = deepfake ON
@@ -615,19 +612,15 @@ def main() -> int:
     raw_q      = queue.Queue(maxsize=QUEUE_MAX)   # cam  → swap worker
     swapped_q  = queue.Queue(maxsize=QUEUE_MAX)   # swap → display + detect
     detect_q   = queue.Queue(maxsize=QUEUE_MAX)   # output frames → detect worker
-    raw_det_q  = queue.Queue(maxsize=QUEUE_MAX)   # raw frames → raw detect worker
 
     swap_worker = _SwapWorker(swapper, raw_q, swapped_q, swap_flag, stop_flag)
     swap_worker.start()
 
-    detect_worker     = None
-    raw_detect_worker = None
+    detect_worker = None
     if detector is not None:
-        detect_worker     = _DetectWorker(detector,     embed_out, detect_q,  stop_flag)
-        raw_detect_worker = _DetectWorker(raw_detector, embed_raw, raw_det_q, stop_flag)
+        detect_worker = _DetectWorker(detector, embed_out, detect_q, stop_flag)
         detect_worker.start()
-        raw_detect_worker.start()
-        print("[embed] Enrolling real face — keep swap OFF for first 30 frames…")
+        print("[embed] Calibrating — keep swap OFF for first few seconds…")
 
     print("\n── DLC Bridge running ──────────────────────────────────────────")
     print("  SPACE  toggle deepfake on/off")
@@ -654,13 +647,6 @@ def main() -> int:
             except queue.Full:
                 pass
 
-            # also push raw frame to the raw detector (always scores real feed)
-            if raw_detect_worker is not None:
-                try:
-                    raw_det_q.put_nowait(raw_frame)
-                except queue.Full:
-                    pass
-
             # Grab the latest swapped pair.  If the queue is empty (worker
             # is mid-processing) we HOLD the last known frame — never fall
             # back to raw_frame which causes real↔fake alternation.
@@ -681,14 +667,6 @@ def main() -> int:
                     pass
 
             # ── build display ────────────────────────────────────────────────
-            # Left panel: raw feed + its own detection score
-            raw_disp = raw_display.copy()
-            if raw_detect_worker is not None:
-                raw_result, raw_embed, _ = raw_detect_worker.get_result()
-                _draw_detection_overlay(raw_disp, raw_result, raw_embed,
-                                        embed_raw.warmup_progress, swap_on=False)
-
-            # Right panel: output feed + output detection score
             out_display = out_frame.copy()
             swap_on = swap_flag.is_set()
             if detect_worker is not None:
@@ -699,20 +677,16 @@ def main() -> int:
                 detect_ms = 0.0
 
             ph    = DISPLAY_H
-            scale = ph / raw_display.shape[0]
-            pw    = int(raw_display.shape[1] * scale)
-            left  = cv2.resize(raw_disp,     (pw, ph))
-            right = cv2.resize(out_display,  (pw, ph))
+            scale = ph / out_frame.shape[0]
+            pw    = int(out_frame.shape[1] * scale)
+            panel = cv2.resize(out_display, (pw, ph))
 
-            cv2.putText(left, "YOU (raw)", (8, 20),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, _GREY, 1, cv2.LINE_AA)
-            cv2.putText(right,
-                        "DEEPFAKE (ON)" if swap_on else "OUTPUT (swap off)",
+            cv2.putText(panel,
+                        "DEEPFAKE ON" if swap_on else "SWAP OFF",
                         (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
                         _RED if swap_on else _GREEN, 1, cv2.LINE_AA)
 
-            divider = np.full((ph, 4, 3), 60, dtype=np.uint8)
-            canvas  = np.hstack([left, divider, right])
+            canvas = panel
 
             t1 = time.perf_counter()
             frame_times.append(t1 - t0)
@@ -761,7 +735,6 @@ def main() -> int:
                         with detect_worker._lock:
                             detect_worker.result = None
                             detect_worker.embed_score = None
-                # raw detector keeps its state — always sees the real face
 
                 print(f"[bridge] Swap {label}")
 
@@ -777,10 +750,8 @@ def main() -> int:
                             try: q.get_nowait()
                             except queue.Empty: break
                     last_out_frame = last_raw_display = None
-                    # re-enroll since source face changed
                     embed_out.reset()
-                    embed_raw.reset()
-                    print("[embed] Re-enrolling — keep swap OFF for 30 frames…")
+                    print("[embed] Re-calibrating — keep swap OFF for a few seconds…")
                 if was_swapping:
                     swap_flag.set()
 
