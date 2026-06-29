@@ -62,23 +62,13 @@ def _draw_detection_overlay(frame, result, embed_score, warmup_progress, swap_on
                             temporal_warmup=0.0, temporal_sim=None):
     pad, panel_w, panel_h = 10, 240, 135
 
-    # Warmup phase — show both calibration states
-    if warmup_progress < 1.0 and temporal_warmup < 1.0:
-        overlay = frame.copy()
-        cv2.rectangle(overlay, (pad, pad), (pad + panel_w, pad + 70), _BLACK, -1)
-        cv2.addWeighted(overlay, 0.55, frame, 0.45, 0, frame)
-        pct = int(max(warmup_progress, temporal_warmup) * 100)
-        cv2.putText(frame, f"Calibrating… {pct}%", (pad + 8, pad + 22),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, _YELLOW, 1, cv2.LINE_AA)
-        _bar(frame, pad + 8, pad + 30, panel_w - 20, 8,
-             max(warmup_progress, temporal_warmup), _YELLOW)
-        lck = "SWAP LOCKED — face camera" if warmup_progress < 1.0 else "temporal calibrating…"
-        cv2.putText(frame, lck, (pad + 8, pad + 52),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.40, _YELLOW, 1, cv2.LINE_AA)
-        return
-
-    # ── primary signal: enrollment embed → temporal → detector ───────────────
-    if embed_score is not None:
+    # ── primary signal: max(enroll, temporal) — whichever screams FAKE first ──
+    # Temporal adapts over time and is often faster to detect; enrollment is
+    # more conservative. Taking the max means either detector can trigger FAKE.
+    if embed_score is not None and temporal_score is not None:
+        conf    = max(embed_score, temporal_score)
+        src_lbl = "enroll" if embed_score >= temporal_score else "temporal"
+    elif embed_score is not None:
         conf    = embed_score
         src_lbl = "enroll"
     elif temporal_score is not None:
@@ -101,12 +91,16 @@ def _draw_detection_overlay(frame, result, embed_score, warmup_progress, swap_on
                 cv2.FONT_HERSHEY_DUPLEX, 0.85, vc, 2, cv2.LINE_AA)
     _bar(frame, pad + 8, pad + 34, panel_w - 20, 8, conf, vc)
 
-    # Primary sim value
-    sim_str = f"[{src_lbl}] sim={best_sim:.3f}" if best_sim is not None else f"[{src_lbl}]"
+    # Primary sim + enrollment progress hint
+    if warmup_progress < 1.0:
+        pct = int(warmup_progress * 100)
+        sim_str = f"[{src_lbl}] enroll {pct}%"
+    else:
+        sim_str = f"[{src_lbl}] sim={best_sim:.3f}" if best_sim is not None else f"[{src_lbl}]"
     cv2.putText(frame, sim_str, (pad + 8, pad + 55),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.40, _GREY, 1, cv2.LINE_AA)
 
-    # Secondary: temporal fallback row (always shown when available)
+    # Secondary: temporal row
     if temporal_score is not None and src_lbl != "temporal":
         t_col = _RED if temporal_score > 0.60 else _GREEN
         t_str = f"temporal: sim={temporal_sim:.3f}" if temporal_sim is not None else "temporal:"
@@ -114,12 +108,11 @@ def _draw_detection_overlay(frame, result, embed_score, warmup_progress, swap_on
                     cv2.FONT_HERSHEY_SIMPLEX, 0.38, t_col, 1, cv2.LINE_AA)
         _bar(frame, pad + 8, pad + 80, panel_w - 20, 5, temporal_score, t_col)
     elif temporal_score is not None and src_lbl == "temporal":
-        # temporal IS primary — show sim detail
         t_str = f"sim={temporal_sim:.3f}" if temporal_sim is not None else ""
         cv2.putText(frame, t_str, (pad + 8, pad + 75),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.38, _GREY, 1, cv2.LINE_AA)
 
-    # Fallback detector signals
+    # Fallback detector signals (when no embedding at all)
     if embed_score is None and temporal_score is None:
         s = (result.signals or {}) if result else {}
         for i, (name, key) in enumerate([("Temporal", "temporal"), ("Liveness", "liveness")]):
@@ -139,7 +132,7 @@ def _draw_status_bar(canvas, swap_on, fps, detect_ms, show_picker_hint=False):
     sc = _GREEN if swap_on else _GREY
     cv2.putText(canvas, "SWAP: ON" if swap_on else "SWAP: OFF",
                 (10, h - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.55, sc, 1, cv2.LINE_AA)
-    hint = "[SPACE] toggle  [G] pick face  [R] recalibrate  [Q] quit" if show_picker_hint else "[SPACE] toggle  [R] recalibrate  [Q] quit"
+    hint = "[SPACE] toggle  [G] pick face  [R] recal  [Q] quit" if show_picker_hint else "[SPACE] toggle  [R] recalibrate  [Q] quit"
     cv2.putText(canvas, hint,
                 (120, h - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.40, _GREY, 1, cv2.LINE_AA)
     info = f"FPS: {fps:.1f}  det: {detect_ms:.0f}ms"
@@ -288,7 +281,7 @@ class _EmbeddingEnrollDetector:
       Score smoothed over SMOOTH_N frames to suppress jitter.
     """
     ENROLL_N = 50
-    SMOOTH_N = 15   # wider window = less oscillation on transient head turns
+    SMOOTH_N = 8    # faster response — ~0.5s at 15fps to cross FAKE threshold
 
     def __init__(self, detect_fn):
         self._detect   = detect_fn
@@ -376,8 +369,8 @@ class _TemporalShiftDetector:
     Limitation: if swap is already ON at startup, calibration captures the swap
     face → can't detect it. This is fundamental (no reference-free cure).
     """
-    AUTO_N      = 20   # frames to auto-enroll
-    SMOOTH_N    = 15
+    AUTO_N      = 1    # grab first frontal frame → instant template, no warmup
+    SMOOTH_N    = 8    # match enrollment — faster response
     ADAPT_ALPHA = 0.01  # slow template drift during real periods
 
     def __init__(self, detect_fn):
@@ -402,7 +395,7 @@ class _TemporalShiftDetector:
         self._scores.clear()
         self.last_sim  = None
 
-    def update(self, frame: np.ndarray) -> float | None:
+    def update(self, frame: np.ndarray, swap_on: bool = False) -> float | None:
         face = self._detect(frame)
         if face is None or not hasattr(face, "embedding") or face.embedding is None:
             return None
@@ -418,14 +411,19 @@ class _TemporalShiftDetector:
 
         # ── auto-enrollment phase ─────────────────────────────────────────────
         if self._template is None:
+            if swap_on:
+                return None  # never enroll from a swapped frame — wrong reference
             self._buf.append(emb)
             if len(self._buf) >= self.AUTO_N:
                 mean = np.mean(self._buf, axis=0)
                 self._template = mean / np.linalg.norm(mean)
                 sims = [float(np.dot(self._template, s)) for s in self._buf]
-                self._thresh = float(max(0.35, min(sims) - 0.20))
+                # For instant enroll (AUTO_N=1) min(sims)=1.0 → computed thresh=0.80 (too tight).
+                # Use fixed 0.35: empirically safe — real face ~0.47+ even at extreme angles,
+                # face swap ~0.05-0.10. Slow adapt will self-correct over time.
+                self._thresh = 0.35
                 print(f"[temporal] ✓ Auto-enrolled  sim range [{min(sims):.3f}..{max(sims):.3f}]"
-                      f"  thresh={self._thresh:.3f}")
+                      f"  thresh={self._thresh:.3f} (fixed)")
             return None
 
         # ── detection phase ───────────────────────────────────────────────────
@@ -475,13 +473,15 @@ class _DetectWorker(threading.Thread):
     def run(self):
         while not self._stop_flag.is_set():
             try:
-                frame = self._in_q.get(timeout=0.05)
+                item = self._in_q.get(timeout=0.05)
             except queue.Empty:
                 continue
 
+            frame, swap_on = item if isinstance(item, tuple) else (item, False)
+
             # Both embedding checks are fast (dot product after insightface detect)
-            embed_score    = self._embed.update(frame)    if self._embed    else None
-            temporal_score = self._temporal.update(frame) if self._temporal else None
+            embed_score    = self._embed.update(frame)               if self._embed    else None
+            temporal_score = self._temporal.update(frame, swap_on)   if self._temporal else None
 
             self._frame_n += 1
             if self._frame_n % DETECT_EVERY != 0:
@@ -737,17 +737,17 @@ def main() -> int:
         detect_worker = _DetectWorker(detector, embed_out, temporal_det, detect_q, stop_flag)
         detect_worker.start()
         if embed_out:
-            print("[embed]    Calibrating — keep swap OFF for first few seconds…")
-        print("[temporal] Auto-calibrating from first frames — keep real face visible…")
+            print("[embed]    Enrolling in background (50 frames, improves accuracy)…")
+        print("[temporal] Auto-enrolling from first frame — detects immediately…")
 
     print("\n── DLC Bridge running ──────────────────────────────────────────")
     if temporal_only:
         print("  MODE: temporal-only (no swap — detection only)")
     else:
-        print("  SPACE  toggle deepfake on/off (locked until calibrated)")
+        print("  SPACE  toggle deepfake on/off")
     if source_dir:
         print("  G      open face picker grid")
-    print("  R      recalibrate (wipes history — keep swap OFF)")
+    print("  R      recalibrate (wipes history)")
     print("  Q/ESC  quit")
     print("────────────────────────────────────────────────────────────────\n")
 
@@ -785,10 +785,10 @@ def main() -> int:
             raw_display = last_raw_display if last_raw_display is not None else raw_frame
             out_frame   = last_out_frame   if last_out_frame   is not None else raw_frame
 
-            # push output to detect worker (non-blocking)
+            # push output + swap state to detect worker (non-blocking)
             if detect_worker is not None:
                 try:
-                    detect_q.put_nowait(out_frame)
+                    detect_q.put_nowait((out_frame, swap_flag.is_set()))
                 except queue.Full:
                     pass
 
@@ -841,35 +841,30 @@ def main() -> int:
                 if temporal_only:
                     print("[bridge] No swap source — SPACE has no effect in temporal-only mode")
                 else:
-                    # Lock swap during calibration — reference must be YOUR real face
-                    enroll_wp = embed_out.warmup_progress if embed_out else 1.0
-                    if enroll_wp < 1.0:
-                        print("[bridge] Calibrating — swap locked until calibration complete")
-                    elif swap_flag.is_set():
+                    if swap_flag.is_set():
                         swap_flag.clear()
                         label = "OFF ■  (real feed)"
                     else:
                         swap_flag.set()
                         label = "ON ▶  (deepfake active)"
 
-                    if enroll_wp >= 1.0:
-                        for q in (raw_q, swapped_q, detect_q):
-                            while not q.empty():
-                                try:
-                                    q.get_nowait()
-                                except queue.Empty:
-                                    break
-                        last_out_frame   = raw_frame.copy()
-                        last_raw_display = raw_frame.copy()
-                        if detector is not None:
-                            detector.temporal_buffer.clear()
-                            detector.liveness_analyser.reset()
-                            if detect_worker is not None:
-                                with detect_worker._lock:
-                                    detect_worker.result = None
-                                    detect_worker.embed_score = None
-                                    detect_worker.temporal_score = None
-                        print(f"[bridge] Swap {label}")
+                    for q in (raw_q, swapped_q, detect_q):
+                        while not q.empty():
+                            try:
+                                q.get_nowait()
+                            except queue.Empty:
+                                break
+                    last_out_frame   = raw_frame.copy()
+                    last_raw_display = raw_frame.copy()
+                    if detector is not None:
+                        detector.temporal_buffer.clear()
+                        detector.liveness_analyser.reset()
+                        if detect_worker is not None:
+                            with detect_worker._lock:
+                                detect_worker.result = None
+                                detect_worker.embed_score = None
+                                detect_worker.temporal_score = None
+                    print(f"[bridge] Swap {label}")
 
             elif key in (ord("r"), ord("R")):
                 # Recalibrate: wipe history, force swap OFF, restart calibration
