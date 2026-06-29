@@ -81,7 +81,7 @@ def _draw_detection_overlay(frame, result, embed_score, warmup_progress, swap_on
         conf    = s.get("temporal", 0.0) or 0.0
         src_lbl = "temporal"
 
-    is_fake = conf > 0.50
+    is_fake = conf > 0.60   # harder threshold — needs sustained swap, not transient head turn
     vc      = _RED if is_fake else _GREEN
     verdict = f"{'FAKE' if is_fake else 'REAL'}  {conf:.2f}"
 
@@ -266,7 +266,7 @@ class _EmbeddingEnrollDetector:
       Score smoothed over SMOOTH_N frames to suppress jitter.
     """
     ENROLL_N = 50
-    SMOOTH_N = 10
+    SMOOTH_N = 15   # wider window = less oscillation on transient head turns
 
     def __init__(self, detect_fn):
         self._detect   = detect_fn
@@ -315,9 +315,10 @@ class _EmbeddingEnrollDetector:
                 mean = np.mean(self._samples, axis=0)
                 self._template = mean / np.linalg.norm(mean)
                 sims = [float(np.dot(self._template, s)) for s in self._samples]
-                # Use min-buffer as threshold — guaranteed to be below all enrollment sims.
-                # Fixed threshold is safer than adaptive (which computed 0.808, too high).
-                self._thresh = float(max(0.40, min(sims) - 0.08))
+                # Threshold = well below enrollment minimum, but above Marquez (~0.0).
+                # Data shows: Dan minimum ~0.47-0.57, Marquez sim ~0.00-0.04.
+                # Use min - 0.20 with floor at 0.40 → ~0.46 for typical enrollment.
+                self._thresh = float(max(0.40, min(sims) - 0.20))
                 print(f"[embed] ✓ Enrolled  sim range [{min(sims):.3f}..{max(sims):.3f}]"
                       f"  thresh={self._thresh:.3f}")
             return None
