@@ -251,111 +251,86 @@ class _SwapWorker(threading.Thread):
                     pass
 
 
-class _EmbeddingVarianceDetector:
-    """Detect face swap via nearest-neighbour identity drift (no reference needed).
+class _EmbeddingEnrollDetector:
+    """Enroll real face once, compare every frame to that fixed template.
 
-    Strategy:
-      Keep a rolling history of HISTORY_SIZE normalised face embeddings.
-      Compare the current embedding against the *closest* match in the
-      reference zone (DELAY_LOW..DELAY_HIGH frames ago).
+    Phase 1 — ENROLLMENT (swap locked OFF):
+      Collect ENROLL_N frames, compute mean normalised embedding = template.
+      Compute adaptive threshold from the spread of enrollment similarities
+      (mean − 3σ), so it calibrates to the actual face.
 
-      Pose-robustness: because the NN search scans all reference poses,
-      if your current head angle appeared in the reference, it matches.
-      A different person (face swap) has NO close match at all.
-
-    Adaptive threshold:
-      Rather than a hardcoded cutoff, the threshold is learned from the
-      distribution of observed NN similarities (mean − 2.5σ). This adapts
-      to the actual face: if you regularly get best_sim=0.92, threshold
-      becomes ~0.87; a swap dropping to 0.35 is well below that.
-
-    History is NOT cleared on toggle: the reference zone spans your real
-    face frames. When swap turns ON, the current Marquez embedding diverges
-    from those real-face references → FAKE detected within DELAY_LOW frames.
-
-    Score is smoothed over SMOOTH_N frames to prevent rapid oscillation.
-    Terminal logs every ~2s: best_sim, adaptive threshold, and verdict.
+    Phase 2 — DETECTION:
+      Each frame: cosine similarity vs template.
+      Same person → sim ~0.85-0.99 → low fake score.
+      Different person (face swap) → sim ~0.20-0.60 → high fake score.
+      Score smoothed over SMOOTH_N frames to suppress jitter.
     """
-    HISTORY_SIZE = 120
-    DELAY_LOW    = 10    # reference zone start (frames ago)
-    DELAY_HIGH   = 80    # reference zone end — wider zone = more pose variety captured
-    SMOOTH_N     = 8     # rolling average to suppress oscillation
+    ENROLL_N = 50
+    SMOOTH_N = 10
 
-    def __init__(self, detect_one_face_fn):
-        self._detect    = detect_one_face_fn
-        self._history:  collections.deque[np.ndarray] = collections.deque(maxlen=self.HISTORY_SIZE)
-        self._sim_hist: collections.deque[float]       = collections.deque(maxlen=300)
-        self._scores:   collections.deque[float]       = collections.deque(maxlen=self.SMOOTH_N)
+    def __init__(self, detect_fn):
+        self._detect   = detect_fn
+        self._samples: list[np.ndarray] = []
+        self._template: np.ndarray | None = None
+        self._thresh:   float = 0.65
+        self._scores:   collections.deque[float] = collections.deque(maxlen=self.SMOOTH_N)
+        self.last_sim:  float | None = None
         self._log_t:    float = 0.0
-        self.last_best_sim: float | None = None   # exposed for overlay display
 
     @property
     def warmup_progress(self) -> float:
-        return min(1.0, len(self._history) / self.DELAY_HIGH)
+        if self._template is not None:
+            return 1.0
+        return len(self._samples) / self.ENROLL_N
 
     def reset(self):
-        """Only call when source identity changes (face picker).
-        Do NOT call on swap toggle — pre-toggle frames are the reference."""
-        self._history.clear()
-        self._sim_hist.clear()
+        self._samples.clear()
+        self._template = None
+        self._thresh   = 0.65
         self._scores.clear()
-        self.last_best_sim = None
-
-    def _adaptive_thresh(self) -> float:
-        """Learned threshold: mean − 2.5σ.  Needs ≥30 samples; floor at 0.45."""
-        if len(self._sim_hist) < 30:
-            return 0.60   # conservative fallback — avoids false FAKEs early on
-        mu = float(np.mean(self._sim_hist))
-        sd = float(np.std(self._sim_hist))
-        return float(max(0.45, mu - 2.5 * sd))
+        self.last_sim  = None
 
     def update(self, frame: np.ndarray) -> float | None:
-        """Returns smoothed fake score 0–1, or None during warmup."""
         face = self._detect(frame)
         if face is None or not hasattr(face, "embedding") or face.embedding is None:
             return None
 
-        emb = face.embedding.astype(np.float32)
+        emb  = face.embedding.astype(np.float32)
         norm = np.linalg.norm(emb)
         if norm < 1e-6:
             return None
         emb /= norm
-        self._history.append(emb)
 
-        if len(self._history) < self.DELAY_HIGH:
-            return None   # still warming up
-
-        hist = list(self._history)
-        n    = len(hist)
-        ref  = hist[max(0, n - self.DELAY_HIGH) : n - self.DELAY_LOW]
-        if len(ref) < 5:
+        # ── enrollment phase ──────────────────────────────────────────────────
+        if self._template is None:
+            self._samples.append(emb)
+            if len(self._samples) >= self.ENROLL_N:
+                mean = np.mean(self._samples, axis=0)
+                self._template = mean / np.linalg.norm(mean)
+                sims = [float(np.dot(self._template, s)) for s in self._samples]
+                mu   = float(np.mean(sims))
+                sd   = float(np.std(sims))
+                self._thresh = float(max(0.45, mu - 3.0 * sd))
+                print(f"[embed] ✓ Enrolled  sim range [{min(sims):.3f}..{max(sims):.3f}]"
+                      f"  thresh={self._thresh:.3f}")
             return None
 
-        # Nearest-neighbour: best matching pose in reference window
-        best_sim = float(max(np.dot(r, emb) for r in ref))
-        self.last_best_sim = best_sim
-        thresh   = self._adaptive_thresh()
+        # ── detection phase ───────────────────────────────────────────────────
+        sim = float(np.dot(self._template, emb))
+        self.last_sim = sim
 
-        # Only add to threshold learner when it looks like the real/stable face
-        # (don't let a sustained swap corrupt the baseline)
-        if best_sim > thresh - 0.05:
-            self._sim_hist.append(best_sim)
-
-        # Sigmoid: best_sim >> thresh → score 0 (REAL); best_sim << thresh → score 1 (FAKE)
-        raw_score = float(1.0 / (1.0 + np.exp(25.0 * (best_sim - thresh))))
-
-        # Smooth over last SMOOTH_N frames to suppress oscillation
-        self._scores.append(raw_score)
+        # sim >> thresh → same person → score 0 (REAL)
+        # sim << thresh → different person → score 1 (FAKE)
+        raw = float(1.0 / (1.0 + np.exp(20.0 * (sim - self._thresh))))
+        self._scores.append(raw)
         score = float(np.mean(self._scores))
 
-        # Terminal log every ~2s
         now = time.monotonic()
         if now - self._log_t > 2.0:
             self._log_t = now
-            verdict = "FAKE" if score > 0.50 else "REAL"
-            n_samples = len(self._sim_hist)
-            print(f"[embed] {verdict:4s}  best_sim={best_sim:.3f}  "
-                  f"thresh={thresh:.3f} ({n_samples} samples)  score={score:.2f}")
+            verdict = "FAKE" if score > 0.5 else "REAL"
+            print(f"[embed] {verdict}  sim={sim:.3f}  thresh={self._thresh:.3f}"
+                  f"  score={score:.2f}")
 
         return float(np.clip(score, 0.0, 1.0))
 
@@ -363,7 +338,7 @@ class _EmbeddingVarianceDetector:
 class _DetectWorker(threading.Thread):
     """Runs deepfake detector + embedding identity check every DETECT_EVERY frames."""
 
-    def __init__(self, detector, embed_detector: _EmbeddingVarianceDetector,
+    def __init__(self, detector, embed_detector: _EmbeddingEnrollDetector,
                  in_q: queue.Queue, stop_flag: threading.Event):
         super().__init__(daemon=True)
         self._detector       = detector
@@ -591,7 +566,7 @@ def main() -> int:
     # Must use get_one_face (full pipeline) — detect_one_face_fast skips the
     # recognition model and returns Face objects without .embedding.
     from modules.face_analyser import get_one_face as _get_one_face_full
-    embed_out = _EmbeddingVarianceDetector(_get_one_face_full)  # scores output feed
+    embed_out = _EmbeddingEnrollDetector(_get_one_face_full)  # scores output feed
 
     # ── thread plumbing ──────────────────────────────────────────────────────
     swap_flag  = threading.Event()   # set = deepfake ON
@@ -662,7 +637,7 @@ def main() -> int:
                 result, out_embed, detect_ms = detect_worker.get_result()
                 _draw_detection_overlay(out_display, result, out_embed,
                                         embed_out.warmup_progress, swap_on,
-                                        best_sim=embed_out.last_best_sim)
+                                        best_sim=embed_out.last_sim)
             else:
                 detect_ms = 0.0
 
