@@ -57,22 +57,22 @@ def _bar(frame, x, y, w, h, value, colour):
         cv2.rectangle(frame, (x, y), (x + filled, y + h), colour, -1)
 
 
-def _draw_detection_overlay(frame, result, embed_score, warmup_progress, swap_on):
-    pad, panel_w, panel_h = 10, 240, 110
+def _draw_detection_overlay(frame, result, embed_score, warmup_progress, swap_on, best_sim=None):
+    pad, panel_w, panel_h = 10, 240, 115
 
-    # Warmup phase
+    # Warmup phase — swap is LOCKED OFF during this period
     if warmup_progress < 1.0:
         overlay = frame.copy()
-        cv2.rectangle(overlay, (pad, pad), (pad + panel_w, pad + 50), _BLACK, -1)
+        cv2.rectangle(overlay, (pad, pad), (pad + panel_w, pad + 60), _BLACK, -1)
         cv2.addWeighted(overlay, 0.55, frame, 0.45, 0, frame)
         pct = int(warmup_progress * 100)
         cv2.putText(frame, f"Calibrating… {pct}%", (pad + 8, pad + 22),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, _YELLOW, 1, cv2.LINE_AA)
         _bar(frame, pad + 8, pad + 30, panel_w - 20, 8, warmup_progress, _YELLOW)
+        cv2.putText(frame, "SWAP LOCKED — face camera", (pad + 8, pad + 52),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.40, _YELLOW, 1, cv2.LINE_AA)
         return
 
-    # Embed score is the sole decider when available; fall back to temporal only
-    # if face wasn't detected (embed_score is None).
     if embed_score is not None:
         conf    = embed_score
         src_lbl = "embed"
@@ -93,18 +93,16 @@ def _draw_detection_overlay(frame, result, embed_score, warmup_progress, swap_on
                 cv2.FONT_HERSHEY_DUPLEX, 0.85, vc, 2, cv2.LINE_AA)
     _bar(frame, pad + 8, pad + 34, panel_w - 20, 8, conf, vc)
 
-    cv2.putText(frame, f"via {src_lbl}", (pad + 8, pad + 55),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.38, _GREY, 1, cv2.LINE_AA)
+    # Show raw similarity value for transparency
+    sim_str = f"sim={best_sim:.3f}" if best_sim is not None else f"via {src_lbl}"
+    cv2.putText(frame, sim_str, (pad + 8, pad + 55),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.40, _GREY, 1, cv2.LINE_AA)
 
-    # Sub-signals for debugging
-    signals = [("Spike", None), ("NN drift", None)]  # filled via embed internals
-    if embed_score is not None:
-        pass  # composite score already shown
-    else:
+    if embed_score is None:
         s = (result.signals or {}) if result else {}
         for i, (name, key) in enumerate([("Temporal", "temporal"), ("Liveness", "liveness")]):
             score = s.get(key)
-            yb    = pad + 72 + i * 20
+            yb    = pad + 75 + i * 20
             cv2.putText(frame, f"{name}:", (pad + 8, yb),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.40, _GREY, 1, cv2.LINE_AA)
             if score is not None:
@@ -119,7 +117,7 @@ def _draw_status_bar(canvas, swap_on, fps, detect_ms, show_picker_hint=False):
     sc = _GREEN if swap_on else _GREY
     cv2.putText(canvas, "SWAP: ON" if swap_on else "SWAP: OFF",
                 (10, h - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.55, sc, 1, cv2.LINE_AA)
-    hint = "[SPACE] toggle  [G] pick face  [Q] quit" if show_picker_hint else "[SPACE] toggle  [Q] quit"
+    hint = "[SPACE] toggle  [G] pick face  [R] recalibrate  [Q] quit" if show_picker_hint else "[SPACE] toggle  [R] recalibrate  [Q] quit"
     cv2.putText(canvas, hint,
                 (120, h - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.40, _GREY, 1, cv2.LINE_AA)
     info = f"FPS: {fps:.1f}  det: {detect_ms:.0f}ms"
@@ -289,17 +287,19 @@ class _EmbeddingVarianceDetector:
         self._sim_hist: collections.deque[float]       = collections.deque(maxlen=300)
         self._scores:   collections.deque[float]       = collections.deque(maxlen=self.SMOOTH_N)
         self._log_t:    float = 0.0
+        self.last_best_sim: float | None = None   # exposed for overlay display
 
     @property
     def warmup_progress(self) -> float:
         return min(1.0, len(self._history) / self.DELAY_HIGH)
 
     def reset(self):
-        """Only call this when the source identity changes (face picker). 
-        Do NOT call on swap toggle — we need pre-toggle frames as reference."""
+        """Only call when source identity changes (face picker).
+        Do NOT call on swap toggle — pre-toggle frames are the reference."""
         self._history.clear()
         self._sim_hist.clear()
         self._scores.clear()
+        self.last_best_sim = None
 
     def _adaptive_thresh(self) -> float:
         """Learned threshold: mean − 2.5σ.  Needs ≥30 samples; floor at 0.45."""
@@ -333,6 +333,7 @@ class _EmbeddingVarianceDetector:
 
         # Nearest-neighbour: best matching pose in reference window
         best_sim = float(max(np.dot(r, emb) for r in ref))
+        self.last_best_sim = best_sim
         thresh   = self._adaptive_thresh()
 
         # Only add to threshold learner when it looks like the real/stable face
@@ -610,9 +611,10 @@ def main() -> int:
         print("[embed] Calibrating — keep swap OFF for first few seconds…")
 
     print("\n── DLC Bridge running ──────────────────────────────────────────")
-    print("  SPACE  toggle deepfake on/off")
+    print("  SPACE  toggle deepfake on/off (locked until calibrated)")
     if source_dir:
         print("  G      open face picker grid")
+    print("  R      recalibrate (wipes history — keep swap OFF)")
     print("  Q/ESC  quit")
     print("────────────────────────────────────────────────────────────────\n")
 
@@ -659,7 +661,8 @@ def main() -> int:
             if detect_worker is not None:
                 result, out_embed, detect_ms = detect_worker.get_result()
                 _draw_detection_overlay(out_display, result, out_embed,
-                                        embed_out.warmup_progress, swap_on)
+                                        embed_out.warmup_progress, swap_on,
+                                        best_sim=embed_out.last_best_sim)
             else:
                 detect_ms = 0.0
 
@@ -691,39 +694,43 @@ def main() -> int:
             if key in (ord("q"), ord("Q"), 27):
                 break
             elif key == ord(" "):
-                if swap_flag.is_set():
+                # Lock swap during calibration — reference must be YOUR real face
+                if embed_out.warmup_progress < 1.0:
+                    print("[bridge] Calibrating — swap locked until calibration complete")
+                elif swap_flag.is_set():
                     swap_flag.clear()
                     label = "OFF ■  (real feed)"
                 else:
                     swap_flag.set()
                     label = "ON ▶  (deepfake active)"
 
-                # Flush stale frames from both queues so the swap worker
-                # starts producing frames in the new state immediately.
-                for q in (raw_q, swapped_q, detect_q):
-                    while not q.empty():
-                        try:
-                            q.get_nowait()
-                        except queue.Empty:
-                            break
+                if embed_out.warmup_progress >= 1.0:
+                    for q in (raw_q, swapped_q, detect_q):
+                        while not q.empty():
+                            try:
+                                q.get_nowait()
+                            except queue.Empty:
+                                break
+                    last_out_frame   = raw_frame.copy()
+                    last_raw_display = raw_frame.copy()
+                    if detector is not None:
+                        detector.temporal_buffer.clear()
+                        detector.liveness_analyser.reset()
+                        if detect_worker is not None:
+                            with detect_worker._lock:
+                                detect_worker.result = None
+                                detect_worker.embed_score = None
+                    print(f"[bridge] Swap {label}")
 
-                # Snap the held display frame to the current raw camera
-                # image so we instantly show the correct state while
-                # waiting for the first worker frame in the new state.
-                last_out_frame   = raw_frame.copy()
-                last_raw_display = raw_frame.copy()
-
-                # Do NOT reset embed_out on toggle — the reference window must
-                # keep real-face frames so the NN can detect divergence when swap turns ON.
-                if detector is not None:
-                    detector.temporal_buffer.clear()
-                    detector.liveness_analyser.reset()
-                    if detect_worker is not None:
-                        with detect_worker._lock:
-                            detect_worker.result = None
-                            detect_worker.embed_score = None
-
-                print(f"[bridge] Swap {label}")
+            elif key in (ord("r"), ord("R")):
+                # Recalibrate: wipe history, force swap OFF, restart calibration
+                swap_flag.clear()
+                embed_out.reset()
+                if detect_worker is not None:
+                    with detect_worker._lock:
+                        detect_worker.result = None
+                        detect_worker.embed_score = None
+                print("[bridge] Recalibrating — keep swap OFF…")
 
             elif source_dir and key in (ord("g"), ord("G")):
                 was_swapping = swap_flag.is_set()
