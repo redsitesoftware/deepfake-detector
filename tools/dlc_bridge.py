@@ -57,31 +57,39 @@ def _bar(frame, x, y, w, h, value, colour):
         cv2.rectangle(frame, (x, y), (x + filled, y + h), colour, -1)
 
 
-def _draw_detection_overlay(frame, result, embed_score, warmup_progress, swap_on, best_sim=None):
-    pad, panel_w, panel_h = 10, 240, 115
+def _draw_detection_overlay(frame, result, embed_score, warmup_progress, swap_on,
+                            best_sim=None, temporal_score=None,
+                            temporal_warmup=0.0, temporal_sim=None):
+    pad, panel_w, panel_h = 10, 240, 135
 
-    # Warmup phase — swap is LOCKED OFF during this period
-    if warmup_progress < 1.0:
+    # Warmup phase — show both calibration states
+    if warmup_progress < 1.0 and temporal_warmup < 1.0:
         overlay = frame.copy()
-        cv2.rectangle(overlay, (pad, pad), (pad + panel_w, pad + 60), _BLACK, -1)
+        cv2.rectangle(overlay, (pad, pad), (pad + panel_w, pad + 70), _BLACK, -1)
         cv2.addWeighted(overlay, 0.55, frame, 0.45, 0, frame)
-        pct = int(warmup_progress * 100)
+        pct = int(max(warmup_progress, temporal_warmup) * 100)
         cv2.putText(frame, f"Calibrating… {pct}%", (pad + 8, pad + 22),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, _YELLOW, 1, cv2.LINE_AA)
-        _bar(frame, pad + 8, pad + 30, panel_w - 20, 8, warmup_progress, _YELLOW)
-        cv2.putText(frame, "SWAP LOCKED — face camera", (pad + 8, pad + 52),
+        _bar(frame, pad + 8, pad + 30, panel_w - 20, 8,
+             max(warmup_progress, temporal_warmup), _YELLOW)
+        lck = "SWAP LOCKED — face camera" if warmup_progress < 1.0 else "temporal calibrating…"
+        cv2.putText(frame, lck, (pad + 8, pad + 52),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.40, _YELLOW, 1, cv2.LINE_AA)
         return
 
+    # ── primary signal: enrollment embed → temporal → detector ───────────────
     if embed_score is not None:
         conf    = embed_score
-        src_lbl = "embed"
+        src_lbl = "enroll"
+    elif temporal_score is not None:
+        conf    = temporal_score
+        src_lbl = "temporal"
     else:
         s       = (result.signals or {}) if result else {}
         conf    = s.get("temporal", 0.0) or 0.0
-        src_lbl = "temporal"
+        src_lbl = "fallback"
 
-    is_fake = conf > 0.60   # harder threshold — needs sustained swap, not transient head turn
+    is_fake = conf > 0.60
     vc      = _RED if is_fake else _GREEN
     verdict = f"{'FAKE' if is_fake else 'REAL'}  {conf:.2f}"
 
@@ -93,16 +101,30 @@ def _draw_detection_overlay(frame, result, embed_score, warmup_progress, swap_on
                 cv2.FONT_HERSHEY_DUPLEX, 0.85, vc, 2, cv2.LINE_AA)
     _bar(frame, pad + 8, pad + 34, panel_w - 20, 8, conf, vc)
 
-    # Show raw similarity value for transparency
-    sim_str = f"sim={best_sim:.3f}" if best_sim is not None else f"via {src_lbl}"
+    # Primary sim value
+    sim_str = f"[{src_lbl}] sim={best_sim:.3f}" if best_sim is not None else f"[{src_lbl}]"
     cv2.putText(frame, sim_str, (pad + 8, pad + 55),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.40, _GREY, 1, cv2.LINE_AA)
 
-    if embed_score is None:
+    # Secondary: temporal fallback row (always shown when available)
+    if temporal_score is not None and src_lbl != "temporal":
+        t_col = _RED if temporal_score > 0.60 else _GREEN
+        t_str = f"temporal: sim={temporal_sim:.3f}" if temporal_sim is not None else "temporal:"
+        cv2.putText(frame, t_str, (pad + 8, pad + 75),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, t_col, 1, cv2.LINE_AA)
+        _bar(frame, pad + 8, pad + 80, panel_w - 20, 5, temporal_score, t_col)
+    elif temporal_score is not None and src_lbl == "temporal":
+        # temporal IS primary — show sim detail
+        t_str = f"sim={temporal_sim:.3f}" if temporal_sim is not None else ""
+        cv2.putText(frame, t_str, (pad + 8, pad + 75),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, _GREY, 1, cv2.LINE_AA)
+
+    # Fallback detector signals
+    if embed_score is None and temporal_score is None:
         s = (result.signals or {}) if result else {}
         for i, (name, key) in enumerate([("Temporal", "temporal"), ("Liveness", "liveness")]):
             score = s.get(key)
-            yb    = pad + 75 + i * 20
+            yb    = pad + 95 + i * 20
             cv2.putText(frame, f"{name}:", (pad + 8, yb),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.40, _GREY, 1, cv2.LINE_AA)
             if score is not None:
@@ -341,18 +363,111 @@ class _EmbeddingEnrollDetector:
         return float(np.clip(score, 0.0, 1.0))
 
 
-class _DetectWorker(threading.Thread):
-    """Runs deepfake detector + embedding identity check every DETECT_EVERY frames."""
+class _TemporalShiftDetector:
+    """Fallback detector — no manual enrollment, no source face needed.
 
-    def __init__(self, detector, embed_detector: _EmbeddingEnrollDetector,
+    Auto-calibrates from the first AUTO_N frontal frames (keep swap OFF at start).
+    Slowly adapts template during confirmed-real periods to handle lighting drift.
+
+    Key insight: face-swap changes embedded identity discontinuously.
+      Real movement  → pose/lighting changes, cosine sim stays ~0.65+
+      Face swap      → sim drops to ~0.00-0.10 (different person)
+
+    Limitation: if swap is already ON at startup, calibration captures the swap
+    face → can't detect it. This is fundamental (no reference-free cure).
+    """
+    AUTO_N      = 20   # frames to auto-enroll
+    SMOOTH_N    = 15
+    ADAPT_ALPHA = 0.01  # slow template drift during real periods
+
+    def __init__(self, detect_fn):
+        self._detect   = detect_fn
+        self._buf:     list[np.ndarray] = []
+        self._template: np.ndarray | None = None
+        self._thresh:   float = 0.40
+        self._scores:   collections.deque[float] = collections.deque(maxlen=self.SMOOTH_N)
+        self.last_sim:  float | None = None
+        self._log_t:    float = 0.0
+
+    @property
+    def warmup_progress(self) -> float:
+        if self._template is not None:
+            return 1.0
+        return len(self._buf) / self.AUTO_N
+
+    def reset(self):
+        self._buf.clear()
+        self._template = None
+        self._thresh   = 0.40
+        self._scores.clear()
+        self.last_sim  = None
+
+    def update(self, frame: np.ndarray) -> float | None:
+        face = self._detect(frame)
+        if face is None or not hasattr(face, "embedding") or face.embedding is None:
+            return None
+        if hasattr(face, "det_score") and face.det_score is not None:
+            if float(face.det_score) < 0.65:
+                return None
+
+        emb = face.embedding.astype(np.float32)
+        norm = np.linalg.norm(emb)
+        if norm < 1e-6:
+            return None
+        emb /= norm
+
+        # ── auto-enrollment phase ─────────────────────────────────────────────
+        if self._template is None:
+            self._buf.append(emb)
+            if len(self._buf) >= self.AUTO_N:
+                mean = np.mean(self._buf, axis=0)
+                self._template = mean / np.linalg.norm(mean)
+                sims = [float(np.dot(self._template, s)) for s in self._buf]
+                self._thresh = float(max(0.35, min(sims) - 0.20))
+                print(f"[temporal] ✓ Auto-enrolled  sim range [{min(sims):.3f}..{max(sims):.3f}]"
+                      f"  thresh={self._thresh:.3f}")
+            return None
+
+        # ── detection phase ───────────────────────────────────────────────────
+        sim = float(np.dot(self._template, emb))
+        self.last_sim = sim
+
+        raw = float(1.0 / (1.0 + np.exp(20.0 * (sim - self._thresh))))
+        self._scores.append(raw)
+        score = float(np.mean(self._scores))
+
+        # Slowly adapt template during confident-real periods.
+        # Handles gradual lighting / slight pose drift without contaminating
+        # the reference with fake frames.
+        if score < 0.2:
+            updated = (1 - self.ADAPT_ALPHA) * self._template + self.ADAPT_ALPHA * emb
+            self._template = updated / np.linalg.norm(updated)
+
+        now = time.monotonic()
+        if now - self._log_t > 2.0:
+            self._log_t = now
+            verdict = "FAKE" if score > 0.6 else "REAL"
+            print(f"[temporal] {verdict}  sim={sim:.3f}  thresh={self._thresh:.3f}"
+                  f"  score={score:.2f}")
+
+        return float(np.clip(score, 0.0, 1.0))
+
+
+class _DetectWorker(threading.Thread):
+    """Runs deepfake detector + embedding identity checks every DETECT_EVERY frames."""
+
+    def __init__(self, detector, embed_detector: _EmbeddingEnrollDetector | None,
+                 temporal_detector: "_TemporalShiftDetector | None",
                  in_q: queue.Queue, stop_flag: threading.Event):
         super().__init__(daemon=True)
         self._detector       = detector
         self._embed          = embed_detector
+        self._temporal       = temporal_detector
         self._in_q           = in_q
         self._stop_flag      = stop_flag
         self.result          = None
         self.embed_score     = None
+        self.temporal_score  = None
         self.detect_ms       = 0.0
         self._lock           = threading.Lock()
         self._frame_n        = 0
@@ -364,38 +479,40 @@ class _DetectWorker(threading.Thread):
             except queue.Empty:
                 continue
 
-            # Embedding check every frame (it's fast — just a dot product after detect)
-            embed_score = self._embed.update(frame)
+            # Both embedding checks are fast (dot product after insightface detect)
+            embed_score    = self._embed.update(frame)    if self._embed    else None
+            temporal_score = self._temporal.update(frame) if self._temporal else None
 
             self._frame_n += 1
             if self._frame_n % DETECT_EVERY != 0:
-                if embed_score is not None:
-                    with self._lock:
-                        self.embed_score = embed_score
+                with self._lock:
+                    if embed_score    is not None: self.embed_score    = embed_score
+                    if temporal_score is not None: self.temporal_score = temporal_score
                 continue
 
             t0 = time.perf_counter()
             try:
-                r = self._detector.analyse(frame)
+                r = self._detector.analyse(frame) if self._detector else None
             except Exception:
-                continue
+                r = None
             ms = (time.perf_counter() - t0) * 1000
             with self._lock:
-                self.result      = r
-                self.embed_score = embed_score
-                self.detect_ms   = ms
-            s = r.signals or {}
-            print(
-                f"[detect] {'FAKE' if r.is_fake else 'REAL'} {r.confidence:.2f} | "
-                f"cnn={s.get('cnn', 'n/a')!r:.5} "
-                f"temporal={s.get('temporal', 'n/a')!r:.5} "
-                f"liveness={s.get('liveness', 'n/a')!r:.5} "
-                f"({ms:.0f}ms)"
-            )
+                self.result         = r
+                self.embed_score    = embed_score
+                self.temporal_score = temporal_score
+                self.detect_ms      = ms
+            if r is not None:
+                s = r.signals or {}
+                print(
+                    f"[detect] {'FAKE' if r.is_fake else 'REAL'} {r.confidence:.2f} | "
+                    f"temporal={s.get('temporal', 'n/a')!r:.5} "
+                    f"liveness={s.get('liveness', 'n/a')!r:.5} "
+                    f"({ms:.0f}ms)"
+                )
 
     def get_result(self):
         with self._lock:
-            return self.result, self.embed_score, self.detect_ms
+            return self.result, self.embed_score, self.temporal_score, self.detect_ms
 
 
 # ── image picker grid ─────────────────────────────────────────────────────────
@@ -524,16 +641,19 @@ def main() -> int:
     if source_dir and not Path(source_dir).is_dir():
         print(f"ERROR: source-dir not found: {source_dir}", file=sys.stderr)
         return 1
-    if not args.source and not source_dir:
-        print("ERROR: provide --source or --source-dir", file=sys.stderr)
-        return 1
 
     source_path: str | None = args.source
+    temporal_only = False  # True when no swap source provided
+
     if source_dir and not source_path:
         source_path = _show_picker(source_dir)
         if not source_path:
-            print("No face selected — exiting.")
-            return 0
+            print("No face selected — running in temporal-only mode (no swap).")
+            temporal_only = True
+
+    if not source_path and not source_dir:
+        print("[bridge] No source image — running in TEMPORAL-ONLY mode (no swap).")
+        temporal_only = True
 
     if not Path(args.dlc).is_dir():
         print(f"ERROR: DLC path not found: {args.dlc}", file=sys.stderr)
@@ -554,11 +674,31 @@ def main() -> int:
             print(f"[detector] Could not load ({exc}); swap-only mode.")
 
     # ── DLC swapper ──────────────────────────────────────────────────────────
-    try:
-        swapper = _DLCSwapper(args.dlc, source_path)
-    except Exception as exc:
-        print(f"ERROR initialising DLC swapper: {exc}", file=sys.stderr)
-        return 1
+    if not temporal_only:
+        try:
+            swapper = _DLCSwapper(args.dlc, source_path)
+        except Exception as exc:
+            print(f"ERROR initialising DLC swapper: {exc}", file=sys.stderr)
+            return 1
+    else:
+        # No source — still need to load insightface (for embedding detection)
+        import sys as _sys
+        _sys.path.insert(0, args.dlc)
+        import types as _types
+        _ui_stub = _types.ModuleType("modules.ui")
+        _ui_stub.update_status = lambda *a, **kw: None
+        _ui_stub.check_and_ignore_nsfw = lambda *a, **kw: False
+        _sys.modules.setdefault("modules.ui", _ui_stub)
+        import onnxruntime as _ort
+        _providers = (["CoreMLExecutionProvider", "CPUExecutionProvider"]
+                      if "CoreMLExecutionProvider" in _ort.get_available_providers()
+                      else ["CPUExecutionProvider"])
+        import modules.globals as _g
+        _g.execution_providers = _providers
+        print("[dlc] Loading face analyser for temporal detection…")
+        from modules.face_analyser import get_face_analyser as _gfa
+        _gfa()
+        swapper = None
 
     # ── camera ───────────────────────────────────────────────────────────────
     cap = cv2.VideoCapture(args.camera)
@@ -572,7 +712,11 @@ def main() -> int:
     # Must use get_one_face (full pipeline) — detect_one_face_fast skips the
     # recognition model and returns Face objects without .embedding.
     from modules.face_analyser import get_one_face as _get_one_face_full
-    embed_out = _EmbeddingEnrollDetector(_get_one_face_full)  # scores output feed
+
+    # Enrollment detector: primary when swap source is available
+    embed_out    = _EmbeddingEnrollDetector(_get_one_face_full) if not temporal_only else None
+    # Temporal shift detector: always runs (fallback for unknown/non-enrolled faces)
+    temporal_det = _TemporalShiftDetector(_get_one_face_full)
 
     # ── thread plumbing ──────────────────────────────────────────────────────
     swap_flag  = threading.Event()   # set = deepfake ON
@@ -582,17 +726,25 @@ def main() -> int:
     swapped_q  = queue.Queue(maxsize=QUEUE_MAX)   # swap → display + detect
     detect_q   = queue.Queue(maxsize=QUEUE_MAX)   # output frames → detect worker
 
-    swap_worker = _SwapWorker(swapper, raw_q, swapped_q, swap_flag, stop_flag)
-    swap_worker.start()
+    if swapper is not None:
+        swap_worker = _SwapWorker(swapper, raw_q, swapped_q, swap_flag, stop_flag)
+        swap_worker.start()
+    else:
+        swap_worker = None
 
     detect_worker = None
-    if detector is not None:
-        detect_worker = _DetectWorker(detector, embed_out, detect_q, stop_flag)
+    if detector is not None or embed_out is not None or temporal_det is not None:
+        detect_worker = _DetectWorker(detector, embed_out, temporal_det, detect_q, stop_flag)
         detect_worker.start()
-        print("[embed] Calibrating — keep swap OFF for first few seconds…")
+        if embed_out:
+            print("[embed]    Calibrating — keep swap OFF for first few seconds…")
+        print("[temporal] Auto-calibrating from first frames — keep real face visible…")
 
     print("\n── DLC Bridge running ──────────────────────────────────────────")
-    print("  SPACE  toggle deepfake on/off (locked until calibrated)")
+    if temporal_only:
+        print("  MODE: temporal-only (no swap — detection only)")
+    else:
+        print("  SPACE  toggle deepfake on/off (locked until calibrated)")
     if source_dir:
         print("  G      open face picker grid")
     print("  R      recalibrate (wipes history — keep swap OFF)")
@@ -612,18 +764,22 @@ def main() -> int:
                 break
 
             # push raw frame to swap worker (non-blocking, drop if full)
-            try:
-                raw_q.put_nowait(raw_frame)
-            except queue.Full:
-                pass
+            if swap_worker is not None:
+                try:
+                    raw_q.put_nowait(raw_frame)
+                except queue.Full:
+                    pass
 
             # Grab the latest swapped pair.  If the queue is empty (worker
             # is mid-processing) we HOLD the last known frame — never fall
             # back to raw_frame which causes real↔fake alternation.
-            try:
-                last_raw_display, last_out_frame = swapped_q.get_nowait()
-            except queue.Empty:
-                pass   # keep last_out_frame / last_raw_display
+            if swap_worker is not None:
+                try:
+                    last_raw_display, last_out_frame = swapped_q.get_nowait()
+                except queue.Empty:
+                    pass   # keep last_out_frame / last_raw_display
+            else:
+                last_out_frame = last_raw_display = raw_frame
 
             # Bootstrap: before the first frame arrives show the camera feed
             raw_display = last_raw_display if last_raw_display is not None else raw_frame
@@ -640,10 +796,17 @@ def main() -> int:
             out_display = out_frame.copy()
             swap_on = swap_flag.is_set()
             if detect_worker is not None:
-                result, out_embed, detect_ms = detect_worker.get_result()
-                _draw_detection_overlay(out_display, result, out_embed,
-                                        embed_out.warmup_progress, swap_on,
-                                        best_sim=embed_out.last_sim)
+                result, out_embed, out_temporal, detect_ms = detect_worker.get_result()
+                enroll_wp = embed_out.warmup_progress  if embed_out    else 1.0
+                temprl_wp = temporal_det.warmup_progress if temporal_det else 1.0
+                _draw_detection_overlay(
+                    out_display, result, out_embed,
+                    enroll_wp, swap_on,
+                    best_sim      = embed_out.last_sim    if embed_out    else None,
+                    temporal_score= out_temporal,
+                    temporal_warmup= temprl_wp,
+                    temporal_sim  = temporal_det.last_sim if temporal_det else None,
+                )
             else:
                 detect_ms = 0.0
 
@@ -675,42 +838,51 @@ def main() -> int:
             if key in (ord("q"), ord("Q"), 27):
                 break
             elif key == ord(" "):
-                # Lock swap during calibration — reference must be YOUR real face
-                if embed_out.warmup_progress < 1.0:
-                    print("[bridge] Calibrating — swap locked until calibration complete")
-                elif swap_flag.is_set():
-                    swap_flag.clear()
-                    label = "OFF ■  (real feed)"
+                if temporal_only:
+                    print("[bridge] No swap source — SPACE has no effect in temporal-only mode")
                 else:
-                    swap_flag.set()
-                    label = "ON ▶  (deepfake active)"
+                    # Lock swap during calibration — reference must be YOUR real face
+                    enroll_wp = embed_out.warmup_progress if embed_out else 1.0
+                    if enroll_wp < 1.0:
+                        print("[bridge] Calibrating — swap locked until calibration complete")
+                    elif swap_flag.is_set():
+                        swap_flag.clear()
+                        label = "OFF ■  (real feed)"
+                    else:
+                        swap_flag.set()
+                        label = "ON ▶  (deepfake active)"
 
-                if embed_out.warmup_progress >= 1.0:
-                    for q in (raw_q, swapped_q, detect_q):
-                        while not q.empty():
-                            try:
-                                q.get_nowait()
-                            except queue.Empty:
-                                break
-                    last_out_frame   = raw_frame.copy()
-                    last_raw_display = raw_frame.copy()
-                    if detector is not None:
-                        detector.temporal_buffer.clear()
-                        detector.liveness_analyser.reset()
-                        if detect_worker is not None:
-                            with detect_worker._lock:
-                                detect_worker.result = None
-                                detect_worker.embed_score = None
-                    print(f"[bridge] Swap {label}")
+                    if enroll_wp >= 1.0:
+                        for q in (raw_q, swapped_q, detect_q):
+                            while not q.empty():
+                                try:
+                                    q.get_nowait()
+                                except queue.Empty:
+                                    break
+                        last_out_frame   = raw_frame.copy()
+                        last_raw_display = raw_frame.copy()
+                        if detector is not None:
+                            detector.temporal_buffer.clear()
+                            detector.liveness_analyser.reset()
+                            if detect_worker is not None:
+                                with detect_worker._lock:
+                                    detect_worker.result = None
+                                    detect_worker.embed_score = None
+                                    detect_worker.temporal_score = None
+                        print(f"[bridge] Swap {label}")
 
             elif key in (ord("r"), ord("R")):
                 # Recalibrate: wipe history, force swap OFF, restart calibration
                 swap_flag.clear()
-                embed_out.reset()
+                if embed_out:
+                    embed_out.reset()
+                if temporal_det:
+                    temporal_det.reset()
                 if detect_worker is not None:
                     with detect_worker._lock:
                         detect_worker.result = None
                         detect_worker.embed_score = None
+                        detect_worker.temporal_score = None
                 print("[bridge] Recalibrating — keep swap OFF…")
 
             elif source_dir and key in (ord("g"), ord("G")):
@@ -719,13 +891,17 @@ def main() -> int:
                 new_path = _show_picker(source_dir, current=source_path)
                 if new_path and new_path != source_path:
                     source_path = new_path
-                    swapper.load_source(source_path)
+                    if swapper is not None:
+                        swapper.load_source(source_path)
                     for q in (raw_q, swapped_q, detect_q):
                         while not q.empty():
                             try: q.get_nowait()
                             except queue.Empty: break
                     last_out_frame = last_raw_display = None
-                    embed_out.reset()
+                    if embed_out:
+                        embed_out.reset()
+                    if temporal_det:
+                        temporal_det.reset()
                     print("[embed] Re-calibrating — keep swap OFF for a few seconds…")
                 if was_swapping:
                     swap_flag.set()
