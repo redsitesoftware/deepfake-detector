@@ -295,6 +295,13 @@ class _EmbeddingEnrollDetector:
         if face is None or not hasattr(face, "embedding") or face.embedding is None:
             return None
 
+        # Pose filter: only use high-confidence (roughly frontal) detections.
+        # Extreme head angles cause embedding variance of 0.21-0.93 for the same
+        # person — impossible to threshold. det_score < 0.65 = too much angle.
+        if hasattr(face, "det_score") and face.det_score is not None:
+            if float(face.det_score) < 0.65:
+                return None   # hold last score, don't update
+
         emb  = face.embedding.astype(np.float32)
         norm = np.linalg.norm(emb)
         if norm < 1e-6:
@@ -308,9 +315,9 @@ class _EmbeddingEnrollDetector:
                 mean = np.mean(self._samples, axis=0)
                 self._template = mean / np.linalg.norm(mean)
                 sims = [float(np.dot(self._template, s)) for s in self._samples]
-                mu   = float(np.mean(sims))
-                sd   = float(np.std(sims))
-                self._thresh = float(max(0.45, mu - 3.0 * sd))
+                # Use min-buffer as threshold — guaranteed to be below all enrollment sims.
+                # Fixed threshold is safer than adaptive (which computed 0.808, too high).
+                self._thresh = float(max(0.40, min(sims) - 0.08))
                 print(f"[embed] ✓ Enrolled  sim range [{min(sims):.3f}..{max(sims):.3f}]"
                       f"  thresh={self._thresh:.3f}")
             return None
@@ -319,8 +326,6 @@ class _EmbeddingEnrollDetector:
         sim = float(np.dot(self._template, emb))
         self.last_sim = sim
 
-        # sim >> thresh → same person → score 0 (REAL)
-        # sim << thresh → different person → score 1 (FAKE)
         raw = float(1.0 / (1.0 + np.exp(20.0 * (sim - self._thresh))))
         self._scores.append(raw)
         score = float(np.mean(self._scores))
