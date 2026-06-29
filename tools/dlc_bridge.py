@@ -254,64 +254,63 @@ class _SwapWorker(threading.Thread):
 
 
 class _EmbeddingVarianceDetector:
-    """Detect face swap without a reference image — works on any face.
+    """Detect face swap via nearest-neighbour identity drift (no reference needed).
 
-    Two complementary signals:
+    Strategy:
+      Keep a rolling history of HISTORY_SIZE normalised face embeddings.
+      Compare the current embedding against the *closest* match in the
+      reference zone (DELAY_LOW..DELAY_HIGH frames ago).
 
-    1. SPIKE detection (transition moment):
-       Tracks rolling baseline of consecutive frame-to-frame embedding distances.
-       A face swap causes a sudden anomalous jump (z > SPIKE_K σ above baseline).
-       Score decays linearly over STICKY_SECS after the last spike.
-       Robust to head movement because it measures *relative* change only.
+      Pose-robustness: because the NN search scans all reference poses,
+      if your current head angle appeared in the reference, it matches.
+      A different person (face swap) has NO close match at all.
 
-    2. NEAREST-NEIGHBOUR drift with ADAPTIVE THRESHOLD (sustained identity):
-       Compares current embedding to the closest match in the reference zone
-       (DELAY_LOW..DELAY_HIGH frames ago). The NN search is pose-robust —
-       if any reference frame had a similar head angle, it will match.
-       Threshold is NOT hardcoded: it's learned from observed NN similarities
-       during non-spike periods (mean − 2.5σ), so it adapts to the actual face.
-       Real face: best_sim consistently near ~0.92-0.99 → low fake score.
-       Swap: best_sim drops to ~0.20-0.60 → high fake score.
+    Adaptive threshold:
+      Rather than a hardcoded cutoff, the threshold is learned from the
+      distribution of observed NN similarities (mean − 2.5σ). This adapts
+      to the actual face: if you regularly get best_sim=0.92, threshold
+      becomes ~0.87; a swap dropping to 0.35 is well below that.
 
-    Terminal logs every ~2s show: best_sim, adaptive threshold, and verdict.
+    History is NOT cleared on toggle: the reference zone spans your real
+    face frames. When swap turns ON, the current Marquez embedding diverges
+    from those real-face references → FAKE detected within DELAY_LOW frames.
+
+    Score is smoothed over SMOOTH_N frames to prevent rapid oscillation.
+    Terminal logs every ~2s: best_sim, adaptive threshold, and verdict.
     """
-    REF_SIZE    = 90
-    DELAY_LOW   = 10
-    DELAY_HIGH  = 60
-    SPIKE_WIN   = 25
-    SPIKE_K     = 3.5   # raised from 3.0 — fewer false spikes on head movement
-    STICKY_SECS = 5.0
+    HISTORY_SIZE = 120
+    DELAY_LOW    = 10    # reference zone start (frames ago)
+    DELAY_HIGH   = 80    # reference zone end — wider zone = more pose variety captured
+    SMOOTH_N     = 8     # rolling average to suppress oscillation
 
     def __init__(self, detect_one_face_fn):
-        self._detect      = detect_one_face_fn
-        self._history:    collections.deque[np.ndarray] = collections.deque(maxlen=self.REF_SIZE)
-        self._dists:      collections.deque[float]       = collections.deque(maxlen=self.SPIKE_WIN)
-        self._sim_hist:   collections.deque[float]       = collections.deque(maxlen=200)
-        self._last_emb:   np.ndarray | None = None
-        self._last_spike_t: float = -999.0
-        self._log_t:      float   = 0.0
+        self._detect    = detect_one_face_fn
+        self._history:  collections.deque[np.ndarray] = collections.deque(maxlen=self.HISTORY_SIZE)
+        self._sim_hist: collections.deque[float]       = collections.deque(maxlen=300)
+        self._scores:   collections.deque[float]       = collections.deque(maxlen=self.SMOOTH_N)
+        self._log_t:    float = 0.0
 
     @property
     def warmup_progress(self) -> float:
         return min(1.0, len(self._history) / self.DELAY_HIGH)
 
     def reset(self):
+        """Only call this when the source identity changes (face picker). 
+        Do NOT call on swap toggle — we need pre-toggle frames as reference."""
         self._history.clear()
-        self._dists.clear()
         self._sim_hist.clear()
-        self._last_emb     = None
-        self._last_spike_t = -999.0
+        self._scores.clear()
 
     def _adaptive_thresh(self) -> float:
-        """Learned threshold: mean(observed sims) − 2.5σ.  Floor at 0.50."""
-        if len(self._sim_hist) < 15:
-            return 0.72   # conservative fallback before enough data
+        """Learned threshold: mean − 2.5σ.  Needs ≥30 samples; floor at 0.45."""
+        if len(self._sim_hist) < 30:
+            return 0.60   # conservative fallback — avoids false FAKEs early on
         mu = float(np.mean(self._sim_hist))
         sd = float(np.std(self._sim_hist))
-        return float(max(0.50, mu - 2.5 * sd))
+        return float(max(0.45, mu - 2.5 * sd))
 
     def update(self, frame: np.ndarray) -> float | None:
-        """Returns fake score 0–1, or None during warmup."""
+        """Returns smoothed fake score 0–1, or None during warmup."""
         face = self._detect(frame)
         if face is None or not hasattr(face, "embedding") or face.embedding is None:
             return None
@@ -321,55 +320,43 @@ class _EmbeddingVarianceDetector:
         if norm < 1e-6:
             return None
         emb /= norm
-
-        # ── spike (frame-to-frame z-score) ────────────────────────────────────
-        if self._last_emb is not None:
-            d = float(1.0 - np.dot(self._last_emb, emb))
-            if len(self._dists) >= 8:
-                mu = float(np.mean(self._dists))
-                sd = float(np.std(self._dists)) + 1e-6
-                z  = (d - mu) / sd
-                if z > self.SPIKE_K:
-                    self._last_spike_t = time.monotonic()
-                    print(f"[embed] SPIKE z={z:.1f}  d={d:.4f}  baseline μ={mu:.4f}")
-            self._dists.append(d)
-        self._last_emb = emb
         self._history.append(emb)
 
-        age         = time.monotonic() - self._last_spike_t
-        spike_score = float(max(0.0, 1.0 - age / self.STICKY_SECS))
-
         if len(self._history) < self.DELAY_HIGH:
-            return spike_score if spike_score > 0.01 else None
+            return None   # still warming up
 
-        # ── NN drift (adaptive threshold) ─────────────────────────────────────
         hist = list(self._history)
         n    = len(hist)
         ref  = hist[max(0, n - self.DELAY_HIGH) : n - self.DELAY_LOW]
         if len(ref) < 5:
-            return spike_score if spike_score > 0.01 else None
+            return None
 
+        # Nearest-neighbour: best matching pose in reference window
         best_sim = float(max(np.dot(r, emb) for r in ref))
         thresh   = self._adaptive_thresh()
 
-        # Update adaptive threshold only when NOT in a spike (avoid learning swap face)
-        if spike_score < 0.20:
+        # Only add to threshold learner when it looks like the real/stable face
+        # (don't let a sustained swap corrupt the baseline)
+        if best_sim > thresh - 0.05:
             self._sim_hist.append(best_sim)
 
-        # Sigmoid centred at adaptive threshold
-        nn_score = float(1.0 / (1.0 + np.exp(25.0 * (best_sim - thresh))))
+        # Sigmoid: best_sim >> thresh → score 0 (REAL); best_sim << thresh → score 1 (FAKE)
+        raw_score = float(1.0 / (1.0 + np.exp(25.0 * (best_sim - thresh))))
 
-        score = float(np.clip(max(spike_score, nn_score), 0.0, 1.0))
+        # Smooth over last SMOOTH_N frames to suppress oscillation
+        self._scores.append(raw_score)
+        score = float(np.mean(self._scores))
 
         # Terminal log every ~2s
         now = time.monotonic()
         if now - self._log_t > 2.0:
             self._log_t = now
             verdict = "FAKE" if score > 0.50 else "REAL"
+            n_samples = len(self._sim_hist)
             print(f"[embed] {verdict:4s}  best_sim={best_sim:.3f}  "
-                  f"thresh={thresh:.3f}  nn={nn_score:.2f}  spike={spike_score:.2f}")
+                  f"thresh={thresh:.3f} ({n_samples} samples)  score={score:.2f}")
 
-        return score
+        return float(np.clip(score, 0.0, 1.0))
 
 
 class _DetectWorker(threading.Thread):
@@ -726,11 +713,11 @@ def main() -> int:
                 last_out_frame   = raw_frame.copy()
                 last_raw_display = raw_frame.copy()
 
-                # Reset output detector state on toggle (fresh baseline for new mode)
+                # Do NOT reset embed_out on toggle — the reference window must
+                # keep real-face frames so the NN can detect divergence when swap turns ON.
                 if detector is not None:
                     detector.temporal_buffer.clear()
                     detector.liveness_analyser.reset()
-                    embed_out.reset()
                     if detect_worker is not None:
                         with detect_worker._lock:
                             detect_worker.result = None
