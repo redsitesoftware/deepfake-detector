@@ -126,15 +126,33 @@ def _draw_detection_overlay(frame, result, embed_score, warmup_progress, swap_on
                             cv2.FONT_HERSHEY_SIMPLEX, 0.40, _GREY, 1, cv2.LINE_AA)
 
 
-def _draw_status_bar(canvas, swap_on, fps, detect_ms, show_picker_hint=False):
+def _draw_raw_overlay(frame, swap_on):
+    """Simple overlay for the raw (real) camera panel in dual-view mode."""
+    pad = 10
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (pad, pad), (pad + 160, pad + 36), _BLACK, -1)
+    cv2.addWeighted(overlay, 0.55, frame, 0.45, 0, frame)
+    cv2.putText(frame, "REAL  (raw input)", (pad + 8, pad + 22),
+                cv2.FONT_HERSHEY_DUPLEX, 0.55, _GREEN, 1, cv2.LINE_AA)
+    # Green border
+    cv2.rectangle(frame, (2, 2), (frame.shape[1] - 2, frame.shape[0] - 2), _GREEN, 2)
+
+
+def _draw_status_bar(canvas, swap_on, fps, detect_ms, show_picker_hint=False, dual_view=False):
     h, w = canvas.shape[:2]
     cv2.rectangle(canvas, (0, h - 28), (w, h), (30, 30, 30), -1)
     sc = _GREEN if swap_on else _GREY
     cv2.putText(canvas, "SWAP: ON" if swap_on else "SWAP: OFF",
                 (10, h - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.55, sc, 1, cv2.LINE_AA)
-    hint = "[SPACE] toggle  [G] pick face  [R] recal  [Q] quit" if show_picker_hint else "[SPACE] toggle  [R] recalibrate  [Q] quit"
+    dv_col = _YELLOW if dual_view else _GREY
+    cv2.putText(canvas, "[D] dual:ON" if dual_view else "[D] dual",
+                (118, h - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.38, dv_col, 1, cv2.LINE_AA)
+    if show_picker_hint:
+        hint = "[SPACE] toggle  [G] faces  [R] recal  [Q] quit"
+    else:
+        hint = "[SPACE] toggle  [R] recalibrate  [Q] quit"
     cv2.putText(canvas, hint,
-                (120, h - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.40, _GREY, 1, cv2.LINE_AA)
+                (210, h - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.38, _GREY, 1, cv2.LINE_AA)
     info = f"FPS: {fps:.1f}  det: {detect_ms:.0f}ms"
     cv2.putText(canvas, info, (w - 170, h - 8),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.45, _WHITE, 1, cv2.LINE_AA)
@@ -747,6 +765,7 @@ def main() -> int:
         print("  SPACE  toggle deepfake on/off")
     if source_dir:
         print("  G      open face picker grid")
+    print("  D      toggle dual-view (real + deepfake side by side)")
     print("  R      recalibrate (wipes history)")
     print("  Q/ESC  quit")
     print("────────────────────────────────────────────────────────────────\n")
@@ -754,6 +773,7 @@ def main() -> int:
     frame_times: list[float] = []
     last_out_frame:   np.ndarray | None = None   # held across empty-queue frames
     last_raw_display: np.ndarray | None = None
+    dual_view = False   # toggled with D key
 
     try:
         while True:
@@ -813,12 +833,31 @@ def main() -> int:
             ph    = DISPLAY_H
             scale = ph / out_frame.shape[0]
             pw    = int(out_frame.shape[1] * scale)
-            panel = cv2.resize(out_display, (pw, ph))
 
-            cv2.putText(panel,
-                        "DEEPFAKE ON" if swap_on else "SWAP OFF",
-                        (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
-                        _RED if swap_on else _GREEN, 1, cv2.LINE_AA)
+            if dual_view:
+                # ── dual-view: real | deepfake side by side ──────────────────
+                raw_panel = cv2.resize(raw_display.copy(), (pw, ph))
+                out_panel = cv2.resize(out_display, (pw, ph))
+                _draw_raw_overlay(raw_panel, swap_on)
+                # Red border on output panel when swap is on
+                border_col = _RED if swap_on else _GREEN
+                cv2.rectangle(out_panel, (2, 2),
+                               (out_panel.shape[1] - 2, out_panel.shape[0] - 2),
+                               border_col, 2)
+                # Label on output panel
+                lbl = "DEEPFAKE OUTPUT" if swap_on else "REAL OUTPUT"
+                cv2.putText(out_panel, lbl, (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.50,
+                            border_col, 1, cv2.LINE_AA)
+                # Divider
+                div = np.zeros((ph, 4, 3), dtype=np.uint8)
+                panel = np.hstack([raw_panel, div, out_panel])
+            else:
+                # ── single-view ───────────────────────────────────────────────
+                panel = cv2.resize(out_display, (pw, ph))
+                cv2.putText(panel,
+                            "DEEPFAKE ON" if swap_on else "SWAP OFF",
+                            (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                            _RED if swap_on else _GREEN, 1, cv2.LINE_AA)
 
             canvas = panel
 
@@ -830,7 +869,8 @@ def main() -> int:
 
             bar = np.zeros((28, canvas.shape[1], 3), dtype=np.uint8)
             canvas = np.vstack([canvas, bar])
-            _draw_status_bar(canvas, swap_on, fps, detect_ms, show_picker_hint=bool(source_dir))
+            _draw_status_bar(canvas, swap_on, fps, detect_ms,
+                             show_picker_hint=bool(source_dir), dual_view=dual_view)
 
             cv2.imshow("DLC Bridge — deepfake-detector", canvas)
 
@@ -865,6 +905,10 @@ def main() -> int:
                                 detect_worker.embed_score = None
                                 detect_worker.temporal_score = None
                     print(f"[bridge] Swap {label}")
+
+            elif key in (ord("d"), ord("D")):
+                dual_view = not dual_view
+                print(f"[bridge] Dual view {'ON' if dual_view else 'OFF'}")
 
             elif key in (ord("r"), ord("R")):
                 # Recalibrate: wipe history, force swap OFF, restart calibration
