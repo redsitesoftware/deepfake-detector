@@ -131,17 +131,61 @@ api.upload_file(
 
 ---
 
-## Dataset alternatives (skip recording)
+## Option A — Pre-trained model (zero-shot, instant)
 
-| Dataset | Access | Size | Face-swap? |
+DeepfakeBench released an EfficientNet-B4 pre-trained on FF++ — download it right now (67 MB, no form):
+
+```bash
+python scripts/download_datasets.py --dfbench
+# Downloads: checkpoints/effnb4_ff_pretrained.pth
+
+# Evaluate zero-shot on your HDF5 dataset
+python scripts/finetune_pretrained.py \
+    --checkpoint checkpoints/effnb4_ff_pretrained.pth \
+    --dataset    data/dataset.h5 \
+    --eval-only
+
+# Fine-tune on DLC-generated data (recommended for best accuracy)
+python scripts/finetune_pretrained.py \
+    --checkpoint checkpoints/effnb4_ff_pretrained.pth \
+    --dataset    data/dataset.h5 \
+    --epochs 20 --freeze-backbone-epochs 5
+```
+
+The pre-trained model was trained on FF++ (Deepfakes + FaceSwap + FaceShifter + Face2Face + NeuralTextures at c23 compression). It will partially detect modern DLC-style deepfakes but benefits from fine-tuning on your specific face-swap tool.
+
+---
+
+## Option B — Public datasets (no form required)
+
+```bash
+# FF++ real videos via yt-dlp (no approval, ~750 videos available)
+python scripts/download_datasets.py --ff-real --ff-limit 100  # start with 100
+
+# DF40 face crops: 40 deepfake methods, Google Drive, no approval (~50 GB)
+python scripts/download_datasets.py --df40 --df40-real
+
+# Everything at once
+python scripts/download_datasets.py --all-no-approval
+```
+
+| Dataset | Access | Size | Face-swap methods | Notes |
+|---|---|---|---|---|
+| **FF++ real videos** | yt-dlp (public dict) | ~25 GB | — (real only) | ~750/977 available |
+| **DF40** | Google Drive (no form) | ~50 GB | ✅ 10 methods (SimSwap, FSGAN, Hififace…) | NeurIPS 2024 |
+| **DeepfakeBench effnb4** | GitHub Releases | 67 MB | — (weights, not data) | Pre-trained on FF++ |
+
+## Option C — Form-gated datasets (~2–7 day wait)
+
+| Dataset | Form | Size | Face-swap? |
 |---|---|---|---|
-| **FaceForensics++** | Email request (~1-3 days) | ~100 GB raw / ~2 GB crops | ✓ DeepFakes, FaceSwap |
-| **DFDC** | Kaggle (instant) | ~470 GB | ✓ multiple methods |
-| **Celeb-DF v2** | GitHub request form | ~3 GB | ✓ GAN-based |
-| **OpenForensics** | Direct download | ~15 GB | ✓ multi-face |
+| **FaceForensics++** fakes | [bit.ly/faceforensics-form](https://bit.ly/faceforensics-form) | ~10 GB (c23) | ✓ Deepfakes, FaceSwap, FaceShifter |
+| **Celeb-DF v2** | [forms.gle/2jYBby6y1FBU3u6q9](https://forms.gle/2jYBby6y1FBU3u6q9) | ~3 GB | ✓ GAN face-swap |
+| **DFDC** | AWS IAM required — [ai.meta.com/datasets/dfdc](https://ai.meta.com/datasets/dfdc/) | ~470 GB | ✓ ~5 methods |
 
-**Fastest path without recording**: DFDC on Kaggle (instant access, face-swap included).  
-See `scripts/download_ff_plus_plus.py` (if FF++ access granted) for automated download.
+**Recommended order**: Start with `--dfbench` (instant, 67 MB) → record your own DLC fakes (Step 1–3) → fine-tune → submit FF++ form for broader generalization.
+
+> **DLC-specific note**: Deep-Live-Cam uses `inswapper_128.onnx` via InsightFace (2024). None of the public datasets include this specific model. Self-generating DLC fakes (Steps 1–3 above) + fine-tuning the pre-trained model gives the best detection accuracy for your deployment scenario.
 
 ---
 
