@@ -111,11 +111,9 @@ def _collect_df40(df40_dir: Path, methods: set[str] | None
             ff_real.zip           ← unzip to real/ff_real/
             celeb_real.zip        ← unzip to real/celeb_real/
           fake/
-            simswap/              ← method subfolder
-              video_000/
-                frame_000.jpg
-            deepfacelab/
-              ...
+            blendface.zip         ← unzip to fake/blendface/
+            simswap.zip           ← unzip to fake/simswap/
+            ...
     """
     real_dir = df40_dir / "real"
     fake_dir = df40_dir / "fake"
@@ -129,20 +127,32 @@ def _collect_df40(df40_dir: Path, methods: set[str] | None
 
     # Also pick up already-extracted images directly under real/
     for p in real_dir.rglob("*"):
-        if p.suffix.lower() in _IMG_EXTS and ".zip" not in str(p):
+        if p.suffix.lower() in _IMG_EXTS and ".unzipped" not in str(p):
             if p not in real_paths:
                 real_paths.append(p)
 
-    # Collect fake crops, optionally filtered by method name
+    # Unzip fake method zips, optionally filtered by method name
     fake_paths: list[Path] = []
     if fake_dir.exists():
-        for method_dir in sorted(fake_dir.iterdir()):
-            if not method_dir.is_dir():
+        for entry in sorted(fake_dir.iterdir()):
+            # Determine method name whether it's a zip or already-extracted dir
+            if entry.suffix.lower() == ".zip":
+                name = entry.stem.lower()
+            elif entry.is_dir():
+                name = entry.name.lower()
+            else:
                 continue
-            name = method_dir.name.lower()
+
             if methods and name not in methods:
                 continue
-            method_paths = sorted(p for p in method_dir.rglob("*")
+
+            # Unzip if needed
+            if entry.suffix.lower() == ".zip":
+                entry = _unzip_if_needed(entry, fake_dir)
+            if not entry.is_dir():
+                continue
+
+            method_paths = sorted(p for p in entry.rglob("*")
                                   if p.suffix.lower() in _IMG_EXTS)
             print(f"  fake/{name}: {len(method_paths)} images")
             fake_paths += method_paths
