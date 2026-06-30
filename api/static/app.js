@@ -104,12 +104,11 @@ btnStart.addEventListener('click', async () => {
     sessionId = data.session_id;
 
     if (!data.face_detected) {
-      setUploadStatus('⚠ No face detected — try another image', 'warn');
-      btnStart.disabled = false;
-      return;
-    }
-    if (!data.dlc_available) {
+      setUploadStatus('⚠ Face uncertain — try a clearer front-facing photo. Proceeding anyway.', 'warn');
+    } else if (!data.dlc_available) {
       setUploadStatus('⚠ DLC unavailable — running detection only', 'warn');
+    } else if (data.warning) {
+      setUploadStatus(`⚠ ${data.warning}`, 'warn');
     } else {
       setUploadStatus('✓ Face locked', 'ok');
     }

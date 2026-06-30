@@ -131,16 +131,34 @@ async def upload_source(file: UploadFile = File(...)) -> JSONResponse:
         raise HTTPException(400, "Empty file")
 
     buf = np.frombuffer(payload, dtype=np.uint8)
-    img = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+
+    # Try IMREAD_UNCHANGED first to preserve alpha/palette, then convert to BGR
+    img = cv2.imdecode(buf, cv2.IMREAD_UNCHANGED)
     if img is None:
         raise HTTPException(400, "Cannot decode image — send JPEG or PNG")
 
+    # Normalise to 3-channel BGR regardless of source format
+    if img.ndim == 2:                        # greyscale
+        img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+    elif img.shape[2] == 4:                  # RGBA/BGRA
+        img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+
+    # Upscale tiny images so InsightFace can find the face
+    h, w = img.shape[:2]
+    if max(h, w) < 256:
+        scale = 256 / max(h, w)
+        img = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_LINEAR)
+
     dlc_ok = _init_dlc()
     source_face = None
+    warning = None
     if dlc_ok:
         source_face = _get_source_face(img)
         if source_face is None:
-            raise HTTPException(422, "No face detected in uploaded image")
+            # Don't hard-fail — let the user proceed, DLC will attempt detection
+            # per-frame on the webcam feed.  Warn so they know the swap may not work.
+            warning = "Face not detected in upload — try a clearer front-facing photo. Swap may not work."
+            logger.warning("Source face not detected in uploaded image")
 
     session_id = uuid.uuid4().hex
     _sessions[session_id] = Session(
@@ -148,11 +166,14 @@ async def upload_source(file: UploadFile = File(...)) -> JSONResponse:
         source_face=source_face,
         source_thumb=_make_thumb(img),
     )
-    return JSONResponse({
+    resp: dict = {
         "session_id": session_id,
         "dlc_available": dlc_ok,
         "face_detected": source_face is not None,
-    })
+    }
+    if warning:
+        resp["warning"] = warning
+    return JSONResponse(resp)
 
 
 @router.get("/api/source/{session_id}/thumb")
