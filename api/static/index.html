@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Deepfake Detector — Live Test</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg: #0d0d0f;
+      --surface: #16171a;
+      --border: #2a2b2e;
+      --text: #e8e8ea;
+      --muted: #6b6c70;
+      --green: #22c55e;
+      --red: #ef4444;
+      --yellow: #eab308;
+      --blue: #3b82f6;
+      --accent: #6366f1;
+    }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: 'SF Mono', 'Fira Code', monospace;
+      font-size: 13px;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+
+    /* ── Header ─────────────────────────────────────────────────────── */
+    header {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      padding: 12px 20px;
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      flex-shrink: 0;
+    }
+    header h1 { font-size: 14px; font-weight: 600; letter-spacing: .5px; color: var(--text); }
+    .badge {
+      font-size: 10px; padding: 2px 7px; border-radius: 999px;
+      background: var(--border); color: var(--muted);
+    }
+    .badge.live { background: #15803d22; color: var(--green); border: 1px solid #15803d55; }
+    #ws-status { margin-left: auto; font-size: 11px; color: var(--muted); }
+
+    /* ── Verdict banner ──────────────────────────────────────────────── */
+    #verdict-bar {
+      display: flex;
+      align-items: center;
+      gap: 20px;
+      padding: 10px 20px;
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      flex-shrink: 0;
+      transition: background .25s;
+    }
+    #verdict-bar.fake { background: #1a0606; border-color: #7f1d1d55; }
+    #verdict-bar.real { background: #031a09; border-color: #14532d55; }
+
+    #verdict-label {
+      font-size: 22px; font-weight: 700; letter-spacing: 2px; min-width: 90px;
+      color: var(--muted);
+    }
+    #verdict-label.fake { color: var(--red); }
+    #verdict-label.real { color: var(--green); }
+
+    .conf-wrap { flex: 1; max-width: 320px; }
+    .conf-label { font-size: 10px; color: var(--muted); margin-bottom: 3px; }
+    .bar-track {
+      height: 10px; background: #ffffff10; border-radius: 5px; overflow: hidden;
+    }
+    .bar-fill {
+      height: 100%; width: 0%; border-radius: 5px;
+      background: var(--green); transition: width .15s, background .15s;
+    }
+    .bar-fill.danger { background: var(--red); }
+    .bar-fill.warn   { background: var(--yellow); }
+
+    .signals {
+      display: flex; gap: 20px; margin-left: 12px;
+    }
+    .sig { display: flex; flex-direction: column; gap: 2px; }
+    .sig-name { font-size: 10px; color: var(--muted); text-transform: uppercase; }
+    .sig-val  { font-size: 14px; font-weight: 600; color: var(--text); }
+    .sig-val.null { color: var(--muted); font-size: 11px; }
+
+    #fps-display { margin-left: auto; color: var(--muted); font-size: 11px; }
+
+    /* ── Main panels ─────────────────────────────────────────────────── */
+    main {
+      flex: 1;
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      grid-template-rows: 1fr;
+      gap: 1px;
+      background: var(--border);
+      overflow: hidden;
+    }
+    main.triple {
+      grid-template-columns: 1fr 1fr 1fr;
+    }
+
+    .panel {
+      background: var(--bg);
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+    .panel-header {
+      padding: 6px 12px;
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      color: var(--muted);
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      flex-shrink: 0;
+    }
+    .panel-body {
+      flex: 1;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      position: relative;
+      overflow: hidden;
+      background: #000;
+    }
+    canvas, video {
+      width: 100%; height: 100%;
+      object-fit: contain;
+      display: block;
+    }
+    .panel-body canvas { position: absolute; top: 0; left: 0; }
+
+    /* ── Setup panel (upload) ────────────────────────────────────────── */
+    #panel-setup {
+      position: fixed; inset: 0;
+      background: var(--bg);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 24px;
+      z-index: 100;
+    }
+    #panel-setup h2 { font-size: 18px; font-weight: 600; }
+    #panel-setup p  { color: var(--muted); font-size: 12px; text-align: center; max-width: 340px; line-height: 1.6; }
+
+    .upload-zone {
+      width: 300px; height: 200px;
+      border: 2px dashed var(--border);
+      border-radius: 12px;
+      display: flex; flex-direction: column;
+      align-items: center; justify-content: center;
+      gap: 12px;
+      cursor: pointer;
+      transition: border-color .2s, background .2s;
+      position: relative;
+    }
+    .upload-zone:hover, .upload-zone.drag { border-color: var(--accent); background: #6366f108; }
+    .upload-zone input[type=file] { position: absolute; inset: 0; opacity: 0; cursor: pointer; }
+    .upload-zone img { max-width: 100%; max-height: 160px; border-radius: 6px; object-fit: contain; }
+    .upload-icon { font-size: 32px; }
+    .upload-hint { font-size: 11px; color: var(--muted); }
+
+    .source-thumb {
+      width: 48px; height: 48px; border-radius: 6px;
+      object-fit: cover; border: 2px solid var(--border);
+      flex-shrink: 0;
+    }
+
+    /* ── Footer / controls ───────────────────────────────────────────── */
+    footer {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 10px 20px;
+      background: var(--surface);
+      border-top: 1px solid var(--border);
+      flex-shrink: 0;
+    }
+
+    button {
+      padding: 6px 14px; border-radius: 6px; border: 1px solid var(--border);
+      background: var(--surface); color: var(--text);
+      font-family: inherit; font-size: 12px; cursor: pointer;
+      transition: background .15s, border-color .15s;
+    }
+    button:hover   { background: #ffffff0a; border-color: var(--accent); }
+    button:disabled { opacity: .4; cursor: not-allowed; }
+    button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+    button.primary:hover { background: #4f46e5; }
+    button.danger  { border-color: #7f1d1d; color: var(--red); }
+    button.danger:hover  { background: #1a060622; }
+
+    #latency { margin-left: auto; color: var(--muted); font-size: 11px; }
+
+    /* ── Overlay canvas text drawn by JS ────────────────────────────── */
+    #no-face-msg {
+      position: absolute; bottom: 10px; left: 50%; transform: translateX(-50%);
+      font-size: 11px; color: var(--yellow); display: none;
+      background: #000000aa; padding: 3px 8px; border-radius: 4px;
+    }
+  </style>
+</head>
+<body>
+
+<!-- Setup overlay -->
+<div id="panel-setup">
+  <h2>🎭 Deepfake Detector</h2>
+  <p>Upload a face image to use as the deepfake source (e.g. a celebrity). Your webcam will be swapped live using Deep-Live-Cam, then analysed for deepfake signals.</p>
+
+  <div class="upload-zone" id="upload-zone">
+    <input type="file" id="file-input" accept="image/*">
+    <div id="upload-placeholder">
+      <div class="upload-icon">🖼️</div>
+      <div class="upload-hint">Click or drag a face image here</div>
+    </div>
+    <img id="upload-preview" style="display:none">
+  </div>
+
+  <div id="upload-status" style="color:var(--muted);font-size:11px;"></div>
+  <button class="primary" id="btn-start" disabled>Start Live Test →</button>
+</div>
+
+<!-- Header -->
+<header>
+  <h1>DEEPFAKE DETECTOR</h1>
+  <span class="badge" id="badge-mode">LIVE TEST</span>
+  <img class="source-thumb" id="source-thumb" style="display:none" alt="source face">
+  <span id="source-name" style="color:var(--muted);font-size:11px;"></span>
+  <span id="ws-status">⬤ disconnected</span>
+</header>
+
+<!-- Verdict bar -->
+<div id="verdict-bar">
+  <div id="verdict-label">—</div>
+
+  <div class="conf-wrap">
+    <div class="conf-label">Confidence</div>
+    <div class="bar-track"><div class="bar-fill" id="conf-bar"></div></div>
+  </div>
+
+  <div class="signals">
+    <div class="sig">
+      <div class="sig-name">CNN</div>
+      <div class="sig-val null" id="sig-cnn">—</div>
+    </div>
+    <div class="sig">
+      <div class="sig-name">Temporal</div>
+      <div class="sig-val null" id="sig-temporal">—</div>
+    </div>
+    <div class="sig">
+      <div class="sig-name">Liveness</div>
+      <div class="sig-val null" id="sig-liveness">—</div>
+    </div>
+  </div>
+
+  <div id="fps-display">FPS: —</div>
+</div>
+
+<!-- Video panels -->
+<main id="main-grid">
+  <!-- Panel 1: Raw webcam -->
+  <div class="panel">
+    <div class="panel-header">📷 Your Webcam (real)</div>
+    <div class="panel-body">
+      <video id="video-raw" autoplay muted playsinline></video>
+      <canvas id="canvas-raw"></canvas>
+    </div>
+  </div>
+
+  <!-- Panel 2: Deepfaked output -->
+  <div class="panel">
+    <div class="panel-header">🎭 Deepfaked (DLC swap)</div>
+    <div class="panel-body" id="swap-panel-body">
+      <canvas id="canvas-swap"></canvas>
+      <div id="no-face-msg">No face detected</div>
+    </div>
+  </div>
+
+  <!-- Panel 3: Detection overlay (hidden until triple mode) -->
+  <div class="panel" id="panel-overlay" style="display:none">
+    <div class="panel-header">🔍 Detection Overlay</div>
+    <div class="panel-body">
+      <canvas id="canvas-overlay"></canvas>
+    </div>
+  </div>
+</main>
+
+<!-- Footer controls -->
+<footer>
+  <button id="btn-triple" title="Show 3rd panel with detection overlay">⊞ Triple View</button>
+  <button id="btn-reset-temporal" title="Reset temporal baseline">↺ Reset Temporal</button>
+  <button class="danger" id="btn-change-face">↩ Change Face</button>
+  <span id="latency">latency: —</span>
+</footer>
+
+<script src="app.js"></script>
+</body>
+</html>
