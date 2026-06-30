@@ -8,6 +8,7 @@ Flow:
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import logging
 import os
@@ -179,6 +180,7 @@ async def live_stream(websocket: WebSocket, session_id: str) -> None:
 
     await websocket.send_json({"type": "ready", "fps_limit": 15})
 
+    loop     = asyncio.get_event_loop()
     detector = Detector(fps=15.0)
     try:
         while True:
@@ -186,14 +188,18 @@ async def live_stream(websocket: WebSocket, session_id: str) -> None:
                 data = await websocket.receive_json()
                 raw_frame = _decode_frame(data["frame"])
 
-                # ── DLC face swap ──────────────────────────────────────────
+                # ── DLC face swap (run in thread — blocks ~100-500ms) ──────
                 if session.source_face is not None:
-                    swapped = _swap_frame(session.source_face, raw_frame)
+                    swapped = await loop.run_in_executor(
+                        None, _swap_frame, session.source_face, raw_frame
+                    )
                 else:
-                    swapped = raw_frame  # passthrough if DLC unavailable
+                    swapped = raw_frame
 
-                # ── Detection on swapped frame ─────────────────────────────
-                result = detector.analyse(swapped)
+                # ── Detection on swapped frame (also CPU-bound) ────────────
+                result = await loop.run_in_executor(
+                    None, detector.analyse, swapped
+                )
 
                 # ── Build response ─────────────────────────────────────────
                 swap_b64 = _encode_frame(swapped)
