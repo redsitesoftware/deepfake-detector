@@ -63,7 +63,11 @@ DF40_FACESWAP_METHODS = [
 # ── Utilities ─────────────────────────────────────────────────────────────────
 
 def _check_tool(name: str) -> bool:
-    return subprocess.run(["which", name], capture_output=True).returncode == 0
+    # Check PATH first, then same directory as the running Python interpreter
+    if subprocess.run(["which", name], capture_output=True).returncode == 0:
+        return True
+    venv_bin = Path(sys.executable).parent / name
+    return venv_bin.exists()
 
 
 def _download_url(url: str, dest: Path, label: str = "") -> bool:
@@ -91,22 +95,29 @@ def _download_url(url: str, dest: Path, label: str = "") -> bool:
         return False
 
 
+def _gdown_cmd() -> list[str]:
+    """Return the gdown command, preferring the venv-local binary."""
+    venv_bin = Path(sys.executable).parent / "gdown"
+    if venv_bin.exists():
+        return [str(venv_bin)]
+    return ["gdown"]
+
+
 def _gdown(file_id: str, dest: Path, label: str = "") -> bool:
-    """Download a single file from Google Drive using gdown or requests."""
+    """Download a single file from Google Drive using gdown."""
     label = label or dest.name
     print(f"[gdown] {label} → {dest}")
     dest.parent.mkdir(parents=True, exist_ok=True)
 
-    if _check_tool("gdown"):
-        r = subprocess.run(
-            ["gdown", "--id", file_id, "-O", str(dest)],
-            capture_output=False,
-        )
-        return r.returncode == 0
-
-    # Fallback: direct download URL (works for smaller files < ~100 MB)
-    url = f"https://drive.google.com/uc?export=download&id={file_id}"
-    return _download_url(url, dest, label)
+    url = f"https://drive.google.com/uc?id={file_id}"
+    r = subprocess.run(
+        _gdown_cmd() + [url, "-O", str(dest)],
+        capture_output=False,
+    )
+    if r.returncode == 0 and dest.exists() and dest.stat().st_size > 10_000:
+        return True
+    print(f"  ERROR: download failed or file too small")
+    return False
 
 
 def _gdown_folder(folder_id: str, dest_dir: Path, label: str = "") -> bool:
@@ -115,13 +126,9 @@ def _gdown_folder(folder_id: str, dest_dir: Path, label: str = "") -> bool:
     print(f"[gdown-folder] {label} → {dest_dir}")
     dest_dir.mkdir(parents=True, exist_ok=True)
 
-    if not _check_tool("gdown"):
-        print("  ERROR: gdown not installed. Run: pip install gdown")
-        return False
-
+    url = f"https://drive.google.com/drive/folders/{folder_id}"
     r = subprocess.run(
-        ["gdown", "--folder", f"https://drive.google.com/drive/folders/{folder_id}",
-         "-O", str(dest_dir), "--remaining-ok"],
+        _gdown_cmd() + ["--folder", url, "-O", str(dest_dir)],
         capture_output=False,
     )
     return r.returncode == 0
@@ -204,18 +211,13 @@ def download_ff_real(output_dir: Path, limit: int | None = None) -> int:
 
 def download_df40(output_dir: Path, faceswap_only: bool = True,
                   include_real: bool = True) -> bool:
-    """Download DF40 pre-processed face crops (no approval required).
-
-    DF40 is a NeurIPS 2024 benchmark with 40 deepfake methods.
-    The training data (~50 GB) is on Google Drive, publicly shared.
-    
-    Args:
-        faceswap_only: Only download face-swap methods (skip talking-head/GAN synthesis)
-        include_real:  Also download the real face crops (FF++ + Celeb-DF domains)
-    """
-    if not _check_tool("gdown"):
+    """Download DF40 pre-processed face crops (no approval required)."""
+    # Ensure gdown is available in this Python environment
+    try:
+        import gdown  # noqa: F401
+    except ImportError:
         print("Installing gdown…")
-        subprocess.run([sys.executable, "-m", "pip", "install", "gdown", "-q"])
+        subprocess.run([sys.executable, "-m", "pip", "install", "gdown", "-q"], check=True)
 
     ok = True
 
