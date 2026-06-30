@@ -48,6 +48,7 @@ def _init_dlc() -> bool:
         try:
             if str(_DLC_PATH) not in sys.path:
                 sys.path.insert(0, str(_DLC_PATH))
+
             import modules.globals as dlc_globals
             dlc_globals.execution_providers = ["CoreMLExecutionProvider", "CPUExecutionProvider"]
             dlc_globals.many_faces = False
@@ -55,6 +56,7 @@ def _init_dlc() -> bool:
             dlc_globals.poisson_blend = False
             dlc_globals.sharpness = 0.0
             dlc_globals.enable_interpolation = False
+            dlc_globals.nsfw_filter = False
             _DLC_LOADED = True
             logger.info("DLC loaded from %s", _DLC_PATH)
             return True
