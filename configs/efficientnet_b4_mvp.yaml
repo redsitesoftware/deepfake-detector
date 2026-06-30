@@ -1,0 +1,58 @@
+# EfficientNet-B4 deepfake detector — MVP training config
+# Targets Deep-Live-Cam style face-swap artifacts specifically.
+# Usage: python scripts/train.py --config configs/efficientnet_b4_mvp.yaml
+
+model:
+  name: efficientnet_b4
+  pretrained: true           # ImageNet weights from timm
+  num_classes: 1             # binary: 0=real, 1=fake
+  drop_rate: 0.3
+  drop_path_rate: 0.2
+
+data:
+  dataset_h5: data/dataset.h5
+  image_size: 224
+  train_split: 0.80
+  val_split:   0.10
+  test_split:  0.10
+  seed: 42
+
+training:
+  epochs: 10
+  batch_size: 32
+  num_workers: 4             # reduce to 2 if MPS OOM
+  optimizer: adamw
+  lr: 2.0e-4
+  weight_decay: 1.0e-4
+  scheduler: cosine          # cosine annealing over all epochs
+  warmup_epochs: 1
+  # class weighting: if real/fake counts differ >2x, auto-balance
+  auto_class_weight: true
+  # save checkpoint with best val AUC (not val loss — avoids DeepfakeBench #186)
+  checkpoint_metric: val_auc
+  checkpoint_path: checkpoints/best.pt
+
+augmentation:
+  # Albumentations pipeline applied during training only
+  - name: ImageCompression
+    params: {quality_range: [60, 95], p: 0.5}
+  - name: GaussNoise
+    params: {std_range: [0.02, 0.08], p: 0.4}
+  - name: HueSaturationValue
+    params: {hue_shift_limit: 10, sat_shift_limit: 20, val_shift_limit: 15, p: 0.4}
+  - name: HorizontalFlip
+    params: {p: 0.5}
+  - name: RandomBrightnessContrast
+    params: {brightness_limit: 0.2, contrast_limit: 0.2, p: 0.4}
+  - name: Normalize
+    params: {mean: [0.485, 0.456, 0.406], std: [0.229, 0.224, 0.225]}
+
+logging:
+  # set WANDB_PROJECT env var to enable W&B; falls back to stdout
+  wandb_project: deepfake-detector
+  log_every_n_steps: 20
+
+export:
+  onnx_opset: 17
+  output_dir: models/
+  fp16: true
