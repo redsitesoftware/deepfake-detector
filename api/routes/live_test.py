@@ -222,4 +222,5 @@ async def live_stream(websocket: WebSocket, session_id: str) -> None:
         pass
     finally:
         detector.close()
-        _sessions.pop(session_id, None)
+        # Don't delete the session here — client may reconnect (e.g. after temporal reset).
+        # Session is cleaned up on DELETE /api/source/{session_id} or "Change Face".

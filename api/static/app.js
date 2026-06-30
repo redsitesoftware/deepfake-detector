@@ -166,6 +166,7 @@ function connectWebSocket() {
 
   ws.onopen = () => {
     setWsStatus('connecting…', 'yellow');
+    // Server sends {"type":"ready"} after accept — capture starts in onmessage
   };
 
   ws.onmessage = e => {
@@ -394,11 +395,18 @@ btnTriple.addEventListener('click', () => {
 });
 
 btnResetTemporal.addEventListener('click', async () => {
-  // Reconnect WS — server creates fresh Detector with clear temporal buffer
-  if (ws) ws.close();
-  frameId = 0;
+  // Close current WS — server creates fresh Detector with clean temporal buffer on reconnect.
+  // Session persists so the source face is retained.
+  stopCapture();
+  if (ws) { ws.close(); ws = null; }
+  frameId   = 0;
   fpsSmooth = 0;
-  setTimeout(connectWebSocket, 300);
+  lastResult = null;
+  fpsDisplay.textContent = 'FPS: —';
+  // Small delay to let server-side WS close cleanly, then reconnect
+  setTimeout(() => {
+    connectWebSocket();
+  }, 500);
 });
 
 btnChangeFace.addEventListener('click', async () => {
@@ -442,5 +450,5 @@ document.addEventListener('keydown', e => {
     e.preventDefault();
     btnResetTemporal.click();
   }
-  if (e.code === 'KeyD') btnTriple.click();
+  if (e.code === 'KeyD' && panelSetup.style.display === 'none') btnTriple.click();
 });
