@@ -9,3 +9,6 @@ build/
 dist/
 deepfake_detector/models/*.task
 deepfake_detector/models/*.onnx
+
+# Large datasets (not committed)
+data/

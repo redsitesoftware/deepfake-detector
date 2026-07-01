@@ -39,7 +39,7 @@ import math
 import sys
 import time
 from pathlib import Path
-
+import cv2
 import h5py
 import numpy as np
 import torch
@@ -47,6 +47,7 @@ import torch.nn as nn
 from efficientnet_pytorch import EfficientNet
 from sklearn.metrics import roc_auc_score
 from torch.utils.data import DataLoader, Dataset
+from tqdm import tqdm
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 
@@ -134,6 +135,12 @@ def load_finetuned_checkpoint(path: str | Path, device: torch.device,
 _IMAGENET_MEAN = (0.485, 0.456, 0.406)
 _IMAGENET_STD  = (0.229, 0.224, 0.225)
 _INPUT_SIZE    = 380   # EfficientNet-B4 native resolution
+_IMG_EXTS      = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+
+_FACESWAP_METHODS = {
+    "blendface", "deepfacelab", "e4s", "facedancer", "faceswap",
+    "fsgan", "hififace", "infoswap", "megafs", "simswap",
+}
 
 
 def _build_transform(augment: bool) -> A.Compose:
@@ -143,8 +150,6 @@ def _build_transform(augment: bool) -> A.Compose:
             A.HorizontalFlip(p=0.5),
             A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.5),
             A.GaussianBlur(blur_limit=(3, 5), p=0.3),
-            A.ImageCompression(quality_lower=70, quality_upper=100, p=0.3),
-            A.CoarseDropout(max_holes=4, max_height=24, max_width=24, p=0.2),
         ]
     ops += [
         A.Normalize(mean=_IMAGENET_MEAN, std=_IMAGENET_STD),
@@ -153,7 +158,92 @@ def _build_transform(augment: bool) -> A.Compose:
     return A.Compose(ops)
 
 
+class PathDataset(Dataset):
+    """Fast dataset that reads directly from image files — no HDF5 overhead.
+
+    For DF40: scans real/ and fake/<method>/ subdirectories, applies a
+    video-level 80/10 split by subdirectory name to prevent leakage.
+    """
+
+    def __init__(self, real_dir: Path, fake_dir: Path, split: str,
+                 transform=None, seed: int = 42,
+                 fake_methods: set[str] | None = None):
+        self._transform = transform
+        self._items: list[tuple[Path, int]] = []
+
+        # Collect paths
+        real_paths = [p for p in real_dir.rglob("*") if p.suffix.lower() in _IMG_EXTS]
+        fake_paths: list[Path] = []
+        for method_dir in sorted(fake_dir.iterdir()):
+            if not method_dir.is_dir():
+                continue
+            name = method_dir.name.lower()
+            if fake_methods and name not in fake_methods:
+                continue
+            fake_paths += [p for p in method_dir.rglob("*")
+                           if p.suffix.lower() in _IMG_EXTS]
+
+        # Video-level split by parent directory name
+        def _session(p: Path, base: Path) -> str:
+            rel = p.relative_to(base)
+            return rel.parts[0] if len(rel.parts) > 1 else "default"
+
+        def _split_sessions(paths: list[Path], base: Path) -> list[Path]:
+            sessions = list({_session(p, base) for p in paths})
+            rng = __import__("random").Random(seed)
+            rng.shuffle(sessions)
+            n = len(sessions)
+            n_train = max(1, int(n * 0.8))
+            n_val   = max(1, int(n * 0.1))
+            if split == "train":
+                keep = set(sessions[:n_train])
+            elif split == "val":
+                keep = set(sessions[n_train:n_train + n_val])
+            else:
+                keep = set(sessions[n_train + n_val:])
+            return [p for p in paths if _session(p, base) in keep]
+
+        real_split = _split_sessions(real_paths, real_dir)
+        fake_split = _split_sessions(fake_paths, fake_dir)
+
+        self._items = [(p, 0) for p in real_split] + [(p, 1) for p in fake_split]
+        __import__("random").Random(seed + 1).shuffle(self._items)
+
+        n_real = sum(1 for _, l in self._items if l == 0)
+        n_fake = sum(1 for _, l in self._items if l == 1)
+        print(f"  PathDataset [{split}]: {len(self._items)} samples "
+              f"(real={n_real}, fake={n_fake})")
+
+    @property
+    def labels(self) -> np.ndarray:
+        return np.array([l for _, l in self._items], dtype=np.int64)
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+    def __getitem__(self, idx: int):
+        path, label = self._items[idx]
+        img = cv2.imread(str(path))
+        if img is None:
+            img = np.zeros((_INPUT_SIZE, _INPUT_SIZE, 3), dtype=np.uint8)
+        else:
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            if img.shape[:2] != (_INPUT_SIZE, _INPUT_SIZE):
+                img = cv2.resize(img, (_INPUT_SIZE, _INPUT_SIZE),
+                                 interpolation=cv2.INTER_LINEAR)
+        if self._transform:
+            img = self._transform(image=img)["image"]
+        else:
+            img = torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
+        return img, label
+
+
 class FaceDataset(Dataset):
+    """HDF5-backed dataset from preprocess_dataset.py.
+
+    NOTE: Slow for large uncompressed HDF5 with big chunks and shuffle.
+    Prefer PathDataset (--df40-dir) for DF40 training.
+    """
     def __init__(self, h5_path: str, split: str, transform=None):
         self._h5_path  = h5_path
         self._split    = split
@@ -188,8 +278,9 @@ def _run_epoch(model, loader, criterion, optimizer, device, train: bool):
     total_loss = 0.0
     all_labels, all_probs = [], []
 
+    phase = "train" if train else "val"
     with torch.set_grad_enabled(train):
-        for imgs, labels in loader:
+        for imgs, labels in tqdm(loader, desc=phase, unit="batch", leave=False):
             imgs   = imgs.to(device)
             labels = labels.to(device).long()   # CrossEntropyLoss expects long
 
@@ -222,7 +313,7 @@ def evaluate(model, loader, device) -> dict:
     model.eval()
     all_labels, all_probs = [], []
     with torch.no_grad():
-        for imgs, labels in loader:
+        for imgs, labels in tqdm(loader, desc="eval", unit="batch", leave=False):
             logits = model(imgs.to(device))
             probs  = torch.softmax(logits, dim=-1)[:, 1]
             all_probs.extend(probs.cpu().tolist())
@@ -265,8 +356,13 @@ def main() -> int:
     )
     parser.add_argument("--checkpoint", required=True,
                         help="Path to effnb4_best.pth or fine-tuned .pt checkpoint")
-    parser.add_argument("--dataset",    required=True,
+    parser.add_argument("--dataset",    default=None,
                         help="HDF5 dataset from preprocess_dataset.py")
+    parser.add_argument("--df40-dir",   default=None,
+                        help="DF40 root dir (data/df40). Faster than HDF5 — "
+                             "reads PNGs directly. Overrides --dataset.")
+    parser.add_argument("--num-workers", type=int, default=4,
+                        help="DataLoader worker count (default: 4)")
     parser.add_argument("--eval-only",  action="store_true",
                         help="Only evaluate — do not fine-tune")
     parser.add_argument("--is-finetuned", action="store_true",
@@ -304,11 +400,36 @@ def main() -> int:
         model = load_dfbench_checkpoint(ckpt_path, device, args.dropout)
     print(f"  Params: {sum(p.numel() for p in model.parameters()):,}")
 
-    # Datasets
+    if not args.dataset and not args.df40_dir:
+        print("ERROR: provide --dataset (HDF5) or --df40-dir (faster, reads PNGs directly)")
+        return 1
+
+    # ── Datasets ─────────────────────────────────────────────────────────────
     val_tf   = _build_transform(augment=False)
-    val_ds   = FaceDataset(args.dataset, "val",  val_tf)
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
-                            num_workers=2, pin_memory=False)
+    train_tf = _build_transform(augment=True)
+    nw = args.num_workers
+
+    if args.df40_dir:
+        df40   = Path(args.df40_dir)
+        real_d = df40 / "real"
+        fake_d = df40 / "fake"
+        print(f"[finetune] PathDataset mode — reading from {df40}")
+        val_ds   = PathDataset(real_d, fake_d, "val",   val_tf,   fake_methods=_FACESWAP_METHODS)
+        train_ds = PathDataset(real_d, fake_d, "train", train_tf, fake_methods=_FACESWAP_METHODS)
+        train_labels = train_ds.labels
+    else:
+        val_ds   = FaceDataset(args.dataset, "val",   val_tf)
+        train_ds = FaceDataset(args.dataset, "train", train_tf)
+        train_labels = train_ds._labels
+
+    # On macOS with MPS, fork-based DataLoader workers deadlock.
+    # Use 'spawn' context to safely parallel-load images alongside MPS inference.
+    mp_ctx = "spawn" if nw > 0 else None
+
+    val_loader   = DataLoader(val_ds,   batch_size=args.batch_size, shuffle=False,
+                              num_workers=nw, pin_memory=False,
+                              persistent_workers=nw > 0,
+                              multiprocessing_context=mp_ctx)
     print(f"[finetune] Val: {len(val_ds)} samples")
 
     # Zero-shot evaluation first
@@ -320,15 +441,15 @@ def main() -> int:
         return 0
 
     # Fine-tuning setup
-    train_tf   = _build_transform(augment=True)
-    train_ds   = FaceDataset(args.dataset, "train", train_tf)
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
-                              num_workers=2, pin_memory=False)
+                              num_workers=nw, pin_memory=False,
+                              persistent_workers=nw > 0,
+                              multiprocessing_context=mp_ctx)
     print(f"[finetune] Train: {len(train_ds)} samples")
 
     # Class balance weight
-    n_real = int((train_ds._labels == 0).sum())
-    n_fake = int((train_ds._labels == 1).sum())
+    n_real = int((train_labels == 0).sum())
+    n_fake = int((train_labels == 1).sum())
     # CrossEntropyLoss with weight=[1/n_real, 1/n_fake] normalized
     total = n_real + n_fake
     w = torch.tensor([total / (2 * n_real), total / (2 * n_fake)],

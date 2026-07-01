@@ -118,24 +118,31 @@ def _collect_df40(df40_dir: Path, methods: set[str] | None
     real_dir = df40_dir / "real"
     fake_dir = df40_dir / "fake"
 
-    # Unzip real face crops
+    # Unzip real face crops and collect paths
     real_paths: list[Path] = []
     for zp in sorted(real_dir.glob("*.zip")):
         extracted = _unzip_if_needed(zp, real_dir)
-        real_paths += sorted(p for p in extracted.rglob("*")
-                             if p.suffix.lower() in _IMG_EXTS)
+        real_paths += [p for p in extracted.rglob("*")
+                       if p.suffix.lower() in _IMG_EXTS]
 
-    # Also pick up already-extracted images directly under real/
+    # Pick up any images that were already extracted (not from a zip)
+    extracted_roots = {real_dir / zp.stem for zp in real_dir.glob("*.zip")}
+    seen = set(real_paths)
     for p in real_dir.rglob("*"):
-        if p.suffix.lower() in _IMG_EXTS and ".unzipped" not in str(p):
-            if p not in real_paths:
+        if p.suffix.lower() in _IMG_EXTS and p not in seen:
+            # Only include if NOT inside an already-processed extracted dir
+            if not any(p.is_relative_to(r) for r in extracted_roots):
                 real_paths.append(p)
+                seen.add(p)
 
     # Unzip fake method zips, optionally filtered by method name
     fake_paths: list[Path] = []
     if fake_dir.exists():
+        # Track which method names have been handled to avoid processing
+        # both blendface.zip AND the already-extracted blendface/ directory
+        handled: set[str] = set()
+
         for entry in sorted(fake_dir.iterdir()):
-            # Determine method name whether it's a zip or already-extracted dir
             if entry.suffix.lower() == ".zip":
                 name = entry.stem.lower()
             elif entry.is_dir():
@@ -143,19 +150,22 @@ def _collect_df40(df40_dir: Path, methods: set[str] | None
             else:
                 continue
 
+            if name in handled:
+                continue
             if methods and name not in methods:
                 continue
 
-            # Unzip if needed
+            # Unzip if needed, then rglob for images
             if entry.suffix.lower() == ".zip":
                 entry = _unzip_if_needed(entry, fake_dir)
             if not entry.is_dir():
                 continue
 
-            method_paths = sorted(p for p in entry.rglob("*")
-                                  if p.suffix.lower() in _IMG_EXTS)
+            method_paths = [p for p in entry.rglob("*")
+                            if p.suffix.lower() in _IMG_EXTS]
             print(f"  fake/{name}: {len(method_paths)} images")
             fake_paths += method_paths
+            handled.add(name)
 
     return sorted(set(real_paths)), sorted(set(fake_paths))
 
@@ -193,9 +203,12 @@ def _write_hdf5(out_path: Path, real_paths: list[Path], fake_paths: list[Path],
                 continue
 
             grp    = f.create_group(split_name)
+            # No compression — face PNGs are dense data, lzf gives <1x ratio
+            # and adds CPU overhead. Uncompressed writes are ~10x faster.
             images = grp.create_dataset(
                 "images", shape=(n, size, size, 3),
-                dtype=np.uint8, compression="gzip", compression_opts=4)
+                dtype=np.uint8,
+                chunks=(64, size, size, 3))
             labels   = grp.create_dataset("labels",  shape=(n,), dtype=np.uint8)
             paths_ds = grp.create_dataset("paths",   shape=(n,),
                                           dtype=h5py.special_dtype(vlen=str))
@@ -210,8 +223,8 @@ def _write_hdf5(out_path: Path, real_paths: list[Path], fake_paths: list[Path],
                 labels[ok] = label
                 paths_ds[ok] = str(path)
                 ok += 1
-                if (i + 1) % 1000 == 0:
-                    print(f"  [{split_name}] {i+1}/{n}…")
+                if (i + 1) % 5000 == 0:
+                    print(f"  [{split_name}] {i+1}/{n}…", flush=True)
 
             if ok < n:
                 grp["images"].resize((ok, size, size, 3))
